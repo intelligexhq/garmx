@@ -1,0 +1,20 @@
+# golangci-lint v2 configuration.
+# Formatting is handled separately by gofumpt (see `make fmt`).
+version: "2"
+
+linters:
+  # Defaults already include errcheck, govet, ineffassign, staticcheck, unused.
+  # (In v2, gosimple and stylecheck are folded into staticcheck.)
+  enable:
+    - misspell
+    - gocritic
+  exclusions:
+    generated: lax
+    paths:
+      - bin
+      # Generated Templ output, once the UI exists.
+      - ".*_templ\\.go$"
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

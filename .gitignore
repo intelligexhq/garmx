@@ -1,0 +1,19 @@
+# Build artifacts
+/bin/
+coverage.out
+coverage.html
+
+# Generated Templ output (regenerated via `make templ`)
+*_templ.go
+
+# Local data / config
+*.db
+*.db-wal
+*.db-shm
+garmx.json.local
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
