@@ -28,6 +28,25 @@ GarmX must be a drop-in stdio MCP server for both.
 **Action:** Wire both against a trivial GarmX and capture the real handshake.
 Write the two tutorials from these captures.
 
+**Findings** (see `docs/research/client-handshakes.md` for raw evidence):
+- **Both clients captured.** Both request `protocolVersion` **2025-11-25**, use
+  integer ids from 0, send `notifications/initialized`, negotiate **leniently**
+  (accepted a server downgrade to 2025-06-18), and their status/health path
+  fetches **only `tools/list`**.
+- **OpenCode 1.17.13:** `clientInfo {opencode,1.17.13}`; advertises **only
+  `roots:{}`**. Config: `opencode.json` → `mcp.<name>` `type:"local"`,
+  `command:[argv…]`, `environment:{}`.
+- **Claude Code 2.1.203:** rich `clientInfo` (name/title/description/websiteUrl/
+  version); advertises **`roots:{listChanged:true}` + `elicitation:{}`**. Config:
+  `claude mcp add … -s local` or project `.mcp.json` `mcpServers.<name>` with
+  `command`/`args`/`env`.
+- **Neither advertises `sampling`; only Claude Code advertises `elicitation`.**
+  Confirms deferring server→client callbacks in v1; the session model must
+  record **per-client** advertised capabilities.
+- Still unobserved for both: `prompts/list`, `resources/list`, a real
+  `tools/call`, and `list_changed` re-fetch behavior — needs an authenticated
+  session, not just a status/list command.
+
 ---
 
 ### 2. Aggregation semantics

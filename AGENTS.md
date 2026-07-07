@@ -28,6 +28,13 @@ If you change `.templ` files, run `make templ` before `make check`.
 
 Rule: **a change is not finished until `make check` is green.**
 
+## Git & commits
+
+**The user owns all commits.** Do not run `git commit`, `git push`, `git tag`,
+or `git reset`. Make and validate changes, then leave them for the user to
+review and commit. It is fine to run read-only git commands (`status`, `diff`,
+`log`) and to `git add` when explicitly asked; never create the commit itself.
+
 ## Commenting Standards
 
 **Add a meaningful doc comment to every Go function and method** — exported or
