@@ -1,38 +1,35 @@
 // Command garmx is the entrypoint for the GarmX MCP aggregating gateway.
 //
 // It runs as a single binary that presents itself to an AI client as one MCP
-// server while fanning requests out to many registered upstream MCP servers.
-// This skeleton parses flags and logs startup; the aggregator, transports, and
-// web UI are not yet wired.
+// server while fanning requests out to registered upstream MCP servers. In this
+// phase `garmx serve --stdio` fronts a single stdio upstream over a full
+// initialize → tools/list → tools/call round-trip; the daemon/shim split, HTTP
+// faces, persistence, and UI are wired in later phases.
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
 	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+
+	"github.com/intelligexhq/garmx/internal/aggregator"
+	"github.com/intelligexhq/garmx/internal/frontend"
+	"github.com/intelligexhq/garmx/internal/upstream"
 )
 
 // version is overridden at build time via -ldflags "-X main.version=...".
 var version = "dev"
 
-// config holds the parsed command-line configuration for the daemon.
-type config struct {
-	// addr is the address the management HTTP server and Streamable HTTP MCP
-	// endpoint bind to. It defaults to loopback because the daemon holds every
-	// upstream server's credentials and must not be exposed by default.
-	addr string
-	// stdio enables the client-facing stdio MCP endpoint, used by clients such
-	// as Claude Code and OpenCode that launch garmx as a subprocess.
-	stdio bool
-}
-
-// main parses flags, constructs a logger, and starts the daemon. It is kept
-// deliberately thin: all real logic lives in internal packages.
+// main dispatches the subcommand and translates errors into an exit code. A
+// -h/-help request is a quiet, successful exit.
 func main() {
 	err := run(os.Args[1:])
-	// A -h/-help request prints usage and is a successful, quiet exit.
 	if errors.Is(err, flag.ErrHelp) {
 		return
 	}
@@ -42,42 +39,112 @@ func main() {
 	}
 }
 
-// run wires up configuration and starts the daemon. It is separated from main
-// so it can return an error (and one day be exercised by tests) rather than
-// calling os.Exit directly.
+// run selects a subcommand. Only `serve` exists today; anything else prints
+// usage. It is separated from main so it can return errors instead of exiting.
 func run(args []string) error {
-	cfg, err := parseFlags(args)
+	if len(args) == 0 {
+		usage()
+		return nil
+	}
+	switch args[0] {
+	case "serve":
+		return serve(args[1:])
+	case "-h", "-help", "--help":
+		usage()
+		return flag.ErrHelp
+	default:
+		usage()
+		return fmt.Errorf("unknown command %q", args[0])
+	}
+}
+
+// usage prints the top-level command summary to stderr.
+func usage() {
+	// Usage output goes to stderr; a write error there is not actionable.
+	_, _ = fmt.Fprintf(os.Stderr, "garmx %s — local MCP aggregating gateway\n\nUsage:\n  garmx serve --stdio --upstream-command <cmd> [flags]\n\nRun `garmx serve -h` for flags.\n", version)
+}
+
+// serveConfig is the parsed configuration for the serve subcommand.
+type serveConfig struct {
+	stdio           bool
+	upstreamName    string
+	upstreamCommand string
+	upstreamArgs    stringSlice
+	upstreamEnv     stringSlice
+}
+
+// serve parses flags, wires the upstream transport → aggregator → stdio
+// frontend, and serves until the client disconnects or a signal arrives.
+func serve(args []string) error {
+	cfg, err := parseServeFlags(args)
 	if err != nil {
 		return err
 	}
+	if !cfg.stdio {
+		return errors.New("only --stdio is implemented in this phase; pass --stdio")
+	}
+	if cfg.upstreamCommand == "" {
+		return errors.New("--upstream-command is required")
+	}
+	if err := aggregator.ValidateServerName(cfg.upstreamName); err != nil {
+		return fmt.Errorf("invalid --upstream-name: %w", err)
+	}
 
+	// Logs go to stderr: stdout is the MCP JSON-RPC wire to the client.
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	logger.Info("garmx starting",
-		"version", version,
-		"addr", cfg.addr,
-		"stdio", cfg.stdio,
-	)
 
-	// Nothing to serve yet: the aggregator, upstream transports, and
-	// HTTP/stdio frontends are wired in here as they are implemented.
-	logger.Info("garmx scaffold ready (no services wired yet)")
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	up := upstream.NewStdioTransport(upstream.StdioConfig{
+		Name:    cfg.upstreamName,
+		Command: cfg.upstreamCommand,
+		Args:    cfg.upstreamArgs,
+		Env:     cfg.upstreamEnv,
+	}, logger)
+
+	agg := aggregator.New(cfg.upstreamName, version, up, logger)
+
+	if err := up.Start(ctx); err != nil {
+		return fmt.Errorf("start upstream: %w", err)
+	}
+	defer func() { _ = up.Stop(context.WithoutCancel(ctx)) }()
+
+	logger.Info("garmx serving stdio", "version", version, "upstream", cfg.upstreamName)
+	server := frontend.NewStdioServer(os.Stdin, os.Stdout, agg, logger)
+	if err := server.Serve(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		return fmt.Errorf("serve: %w", err)
+	}
 	return nil
 }
 
-// parseFlags interprets the command-line arguments into a config. It returns a
-// usage error rather than exiting so callers control process termination.
-func parseFlags(args []string) (config, error) {
-	fs := flag.NewFlagSet("garmx", flag.ContinueOnError)
-	var cfg config
-	fs.StringVar(&cfg.addr, "addr", "127.0.0.1:9735", "address for the web UI and Streamable HTTP MCP endpoint")
+// parseServeFlags interprets serve subcommand arguments.
+func parseServeFlags(args []string) (serveConfig, error) {
+	fs := flag.NewFlagSet("garmx serve", flag.ContinueOnError)
+	var cfg serveConfig
 	fs.BoolVar(&cfg.stdio, "stdio", false, "serve the client-facing MCP endpoint over stdio")
+	fs.StringVar(&cfg.upstreamName, "upstream-name", "upstream", "registered name of the upstream server (used as the tool-name prefix)")
+	fs.StringVar(&cfg.upstreamCommand, "upstream-command", "", "executable of the stdio upstream MCP server")
+	fs.Var(&cfg.upstreamArgs, "upstream-arg", "argument for the upstream command (repeatable)")
+	fs.Var(&cfg.upstreamEnv, "upstream-env", "extra environment for the upstream as KEY=VALUE (repeatable)")
 	fs.Usage = func() {
-		// Write errors to the usage stream (stderr) are not actionable here.
-		_, _ = fmt.Fprintf(fs.Output(), "garmx %s — local MCP aggregating gateway\n\nUsage:\n  garmx [flags]\n\nFlags:\n", version)
+		_, _ = fmt.Fprintf(fs.Output(), "garmx serve — run the client-facing MCP endpoint\n\nFlags:\n")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
-		return config{}, err
+		return serveConfig{}, err
 	}
 	return cfg, nil
+}
+
+// stringSlice is a flag.Value that accumulates repeated string flags.
+type stringSlice []string
+
+// String renders the accumulated values (for flag help output).
+func (s *stringSlice) String() string { return strings.Join(*s, ",") }
+
+// Set appends one occurrence of the flag.
+func (s *stringSlice) Set(v string) error {
+	*s = append(*s, v)
+	return nil
 }

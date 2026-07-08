@@ -12,6 +12,12 @@ coverage.html
 *.db-shm
 garmx.json.local
 
+# Local Claude Code settings (per-user, not shared)
+.claude/settings.local.json
+
+# Stray probe capture logs
+mcpprobe.log
+
 # OS / editor
 .DS_Store
 *.swp

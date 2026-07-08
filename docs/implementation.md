@@ -14,7 +14,8 @@ The plan below assumes the model defined in `architecture.md`:
   management UI on `:9735`. Every client connection is a session against it.
 - **stdio is a thin shim.** `garmx serve --stdio` proxies a client's stdio
   JSON-RPC to the daemon over a local channel, auto-starting the daemon if none
-  runs. The shim holds no state.
+  runs. The shim holds no state. *(Target design; deferred past Phase 1, which
+  runs the aggregator in-process — see the Phase 1 scope note.)*
 - **SQLite is the source of truth** for the catalog; the config file is a
   one-directional seed/import, never a live mirror.
 - **Profiles** scope what each client sees (curation-first; default exposes
@@ -34,15 +35,50 @@ Go module, package directories with `doc.go`, Makefile with the `check` gate,
 
 ---
 
-## Phase 1: MCP core — daemon, one upstream, stdio client
+## Phase 1: MCP core — one upstream, stdio client — done
 
-**Goal:** Claude Code (or OpenCode) launches `garmx serve --stdio`; the shim
-relays to the daemon; a full `initialize` → `tools/list` → `tools/call`
-round-trip works against **one** registered stdio upstream. No aggregation
-across many servers yet, no persistence, no UI.
+**Goal:** Claude Code (or OpenCode) launches `garmx serve --stdio`; a full
+`initialize` → `tools/list` → `tools/call` round-trip works against **one**
+registered stdio upstream. No aggregation across many servers yet, no
+persistence, no UI. **Done** — see the acceptance note below.
 
-This phase de-risks everything: protocol correctness, stdio framing, the
-response demultiplexer, and the shim↔daemon channel.
+This phase de-risks the core: protocol correctness, stdio framing, and the
+response demultiplexer.
+
+> **Scope note — daemon/shim deferred.** `garmx serve --stdio` currently runs
+> the aggregator **in-process** against the upstream (one process per client
+> connection), not as a thin shim relaying to a shared daemon. The daemon/shim
+> split (single-instance daemon, local-socket relay, auto-start, reconnect) is
+> unresolved mechanics (discovery #4b) and only pays off once multiple clients
+> must share upstreams and the UI daemon exists. The aggregator/session/frontend
+> seam is transport-agnostic, so introducing the daemon later is additive, not a
+> rewrite. Until then, each client launches its own `garmx` which does its own
+> upstream handshake.
+
+### Delivered
+
+- `pkg/mcp`: JSON-RPC envelope + typed initialize/list/call surface, fast
+  `Parse`/`Kind` classification, shared newline framing (`ReadMessage`/
+  `WriteMessage`, multi-MB safe).
+- `internal/upstream`: `Transport` interface; `pending` id→chan demux
+  (concurrency-correct, race-tested); `StdioTransport` (subprocess, process
+  group, stderr drain, id allocation, graceful stop).
+- `internal/aggregator`: dispatch (initialize/tools/prompts/resources/ping),
+  `server___tool` prefix on the way out and split on the way in, eager
+  page-merge with client-cursor rejection, `_meta` pass-through, upstream→client
+  notification forwarding; builds on the spike's `naming`/`capabilities`.
+- `internal/frontend`: client-facing stdio server (serialized writes, pushed
+  notifications).
+- `cmd/garmx`: `serve --stdio` wiring with `--upstream-*` flags and signal-based
+  shutdown.
+- Tests: `pkg/mcp` classification/round-trip; `pending` concurrency; a real
+  re-exec subprocess correlation test; aggregator dispatch (prefix/split/drain/
+  cursor/notification); an end-to-end stdio frontend round-trip. `make check`
+  green.
+- **Acceptance:** real **Claude Code** registered `garmx` (fronting a stdio
+  probe), connected, and a live session called `mcp__garmx__probe___echo` — GarmX
+  stripped the prefix to `echo`, routed to the probe, and returned the result
+  with `_meta` preserved.
 
 ### Order of implementation
 

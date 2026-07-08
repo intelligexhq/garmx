@@ -28,31 +28,31 @@ Tasks to progress GarmX. Design docs now live in `docs/`
 
 ## Start here next session
 
-**Phase 1 — MCP core: daemon, one upstream, stdio client** (see
-`docs/implementation.md` Phase 1). Goal: Claude Code / OpenCode launches
-`garmx serve --stdio`, the shim relays to the daemon, and a full
-`initialize` → `tools/list` → `tools/call` round-trip works against **one**
-registered stdio upstream — no multi-server aggregation, persistence, or UI yet.
-This de-risks protocol correctness, stdio framing, the response demux, and the
-shim↔daemon channel.
+**Phase 2 — aggregation: many upstreams, prefixing, profiles** (see
+`docs/implementation.md` Phase 2). The Phase 1 core is done and the seam is
+transport-agnostic. Next: an `upstream.Manager` holding N upstreams (lifecycle,
+restart/backoff), fan-out+merge in the aggregator keyed by profile, the
+`exposedName → (server, original)` route map (replacing the single-server
+Split), `profile.go` (server subset + tool allow/deny), and `notify.go`
+(rebuild affected per-profile views + debounced client emit). Acceptance:
+Claude Code sees tools from **two** real MCP servers at once, scoped by profile.
 
-Design spike is done — the pure aggregation/version rules are pinned and coded
-in `internal/aggregator/naming.go` + `capabilities.go` (with table tests) and
-`pkg/mcp/capabilities.go` (version constants + capability types). Phase 1 builds
-on them. Inputs from the captures already folded in:
+Carry-over decisions already coded and ready to extend:
 
-- Both clients strip their own display prefix and call upstream with the **bare**
-  tool name → GarmX's prefix is purely client-facing; strip before forwarding.
-- Both re-fetch `tools/list` on `list_changed` within ms → build `notify.go`
-  propagation with debounce (Phase 2).
-- Claude Code consumes prompts + resources every session (OpenCode: tools only)
-  → aggregate all three primitives, not just tools.
-- OpenCode sends `notifications/cancelled` for completed calls → no-op stale
-  cancels in the frontend/upstream.
+- `server___tool` split + `MergeServerCapabilities` (union) in
+  `internal/aggregator`; eager page-merge + client-cursor rejection live in
+  `handleList`. Multi-server just adds the route map + per-profile cache.
+- Both clients re-fetch `tools/list` on `list_changed` within ms → `notify.go`
+  fan-out lands; add debounce.
+- OpenCode's post-call `notifications/cancelled` is already dropped as a no-op
+  in the aggregator.
 
-The probe (with mid-session `list_changed` emission) + `opencode.json` provider
-template live in the scratchpad; the full source is in the appendix of
-`docs/research/client-handshakes.md` — rebuild with `go build` if cleared.
+**Also pending:** the daemon/shim split (discovery #4b) — deferred past Phase 1,
+which runs the aggregator in-process. Revisit when multi-client sharing or the
+UI daemon needs it.
+
+The probe + `opencode.json` provider template live in the scratchpad; full
+source is in the appendix of `docs/research/client-handshakes.md`.
 
 ## Next steps
 
@@ -73,9 +73,15 @@ template live in the scratchpad; the full source is in the appendix of
    pref `2025-11-25`; lenient upstream accept + visible mismatch; **union**
    capability merge. In `internal/aggregator/{naming,capabilities}.go` +
    `pkg/mcp/capabilities.go`. Details in `docs/discovery.md` #2/#4 (DECIDED).
-4. [ ] **Phase 1** — `pkg/mcp` typed surface + single stdio upstream + client
-   acceptance gate, informed by the captures above. (Extends the spike's
-   `pkg/mcp/capabilities.go` with `message.go`/`methods.go`/`parse.go`.)
+4. [x] **Phase 1 — MCP core, one stdio upstream, stdio client.** `pkg/mcp`
+   (envelope + methods + parse + framing), `upstream` (Transport, pending demux,
+   StdioTransport), `aggregator` dispatch (prefix/split/drain/`_meta`
+   passthrough/notify forward), `frontend/stdio`, `cmd/garmx serve --stdio`.
+   Unit + subprocess-correlation + end-to-end tests; `make check` green.
+   **Acceptance passed:** real Claude Code called `mcp__garmx__probe___echo`
+   through GarmX. Daemon/shim split deferred (in-process for now; discovery #4b).
+5. [ ] **Phase 2** — multi-upstream aggregation, per-profile merged views,
+   `notify.go` propagation. (Now the "start here" item above.)
 
 ## Later
 
