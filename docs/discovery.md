@@ -45,9 +45,20 @@ Write the two tutorials from these captures.
 - **Neither advertises `sampling`; only Claude Code advertises `elicitation`.**
   Confirms deferring server→client callbacks in v1; the session model must
   record **per-client** advertised capabilities.
-- Still unobserved for both: `prompts/list`, `resources/list`, a real
-  `tools/call`, and `list_changed` re-fetch behavior — needs an authenticated
-  session, not just a status/list command.
+- **Real tool-calling sessions now captured** (OpenCode 1.17.15 on the local
+  llama.cpp Qwen model; Claude Code 2.1.197 on the real model). Findings:
+  - **What each pulls per session:** OpenCode pulls **only `tools/list`** even
+    in a full session; **Claude Code pulls `tools/list` + `prompts/list` +
+    `resources/list`** at startup (not `resources/templates/list`). GarmX must
+    aggregate prompts and resources, not just tools.
+  - **`list_changed` → both re-fetch `tools/list`** within ~2–6 ms of the
+    notification (tool-scoped; they don't re-pull prompts/resources). The
+    `aggregator/notify.go` propagation path lands on live clients.
+  - **`tools/call` sends the bare tool name** upstream (both clients strip their
+    own display prefix — OpenCode `probe_echo`, Claude Code `mcp__probe__echo`),
+    with `_meta.progressToken` (Claude Code adds `claudecode/toolUseId`).
+  - **OpenCode emits `notifications/cancelled` for already-completed calls** —
+    GarmX must no-op a cancel for an unknown/finished request id.
 
 ---
 
@@ -71,7 +82,10 @@ upstreams.
   advertise the capability if **any** upstream has it, and forward
   list-changed accordingly.
 - **`list_changed` propagation:** on upstream change → refresh + rebuild merged
-  view + emit to clients. Confirm debounce/coalescing to avoid storms.
+  view + emit to clients. **Confirmed worthwhile:** both OpenCode and Claude Code
+  re-fetch `tools/list` within ms of a `notifications/tools/list_changed` (see
+  `client-handshakes.md`), so forwarded notifications reach live clients.
+  Debounce/coalesce upstream storms into a single client-facing emit.
 - **Pagination:** `tools/list` etc. support cursors. Decide whether GarmX
   merges all pages eagerly (simpler; fine for local scale) or proxies cursors.
 

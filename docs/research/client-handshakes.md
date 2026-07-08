@@ -71,18 +71,15 @@ Project-local `opencode.json` (also honored: `~/.config/opencode/opencode.json`,
 | `mcp list` fetches | **only `tools/list`** — it did *not* call `prompts/list` or `resources/list` despite our advertising those capabilities |
 | `ping` | not sent during this short-lived connection |
 
-### Not yet observed (needs an authenticated `opencode run` session)
+### Real session observed
 
-`prompts/list`, `resources/list`, `resources/templates/list`, an actual
-`tools/call`, `ping` cadence, and whether OpenCode re-fetches on a
-`notifications/tools/list_changed`. `opencode run` blocks on model-provider
-auth/model selection **before** it starts MCP servers (it hung with no probe
-output), so capturing these requires a working model.
-
-**Next session:** run this via the user's **local llama.cpp Qwen Coder** model
-(free — point OpenCode's provider at the local endpoint), have the probe emit a
-`notifications/tools/list_changed` mid-session, and confirm re-fetch behaviour.
-This is the one unknown that drives GarmX's `aggregator/notify.go` path.
+An authenticated `opencode run` session (OpenCode 1.17.15, driven by the local
+llama.cpp `qwen3-coder-next` model on `:8005`) was captured — see
+[Real session captures](#real-session-captures-authenticated-tool-calling)
+below. Summary: OpenCode pulls **only `tools/list`** even in a real session
+(never `prompts/list` / `resources/list`), completes real `tools/call`
+round-trips with the **bare** tool name, and **does re-fetch `tools/list`** on
+`notifications/tools/list_changed`.
 
 ---
 
@@ -155,19 +152,113 @@ client) so the deferred features can light up per-session later.
 
 ---
 
+## Real session captures (authenticated, tool-calling)
+
+Beyond the status/health path, an authenticated agent session was captured for
+both clients using the same stdio probe (extended to emit a mid-session
+`notifications/tools/list_changed` ~2s after `initialized`, then serve a second
+tool `echo_v2`). Each session asked the model to echo five words via separate
+sequential `echo` calls, keeping the connection open well past the notification.
+
+- **OpenCode 1.17.15** driven by the local **llama.cpp `qwen3-coder-next`**
+  model (`:8005`, OpenAI API). Free; no hosted budget.
+- **Claude Code 2.1.197** driven normally (real Anthropic model, Max
+  subscription).
+
+### What a real session pulls at startup
+
+| List call | OpenCode (real session) | Claude Code (real session) |
+|-----------|-------------------------|----------------------------|
+| `tools/list` | ✅ | ✅ |
+| `prompts/list` | ❌ never | ✅ |
+| `resources/list` | ❌ never | ✅ |
+| `resources/templates/list` | ❌ | ❌ |
+
+**Key divergence:** OpenCode consumes **tools only** — even a full session never
+calls `prompts/list` or `resources/list`. **Claude Code eagerly discovers all
+three** primitive types at session start (tools + prompts + resources, but not
+`resources/templates/list`). This is *more* than its health-check path, which
+pulls only `tools/list`.
+
+### `tools/call` wire shape (verbatim)
+
+OpenCode:
+
+```json
+{"method":"tools/call","params":{"name":"echo","arguments":{"text":"alpha"},"_meta":{"progressToken":2}},"jsonrpc":"2.0","id":2}
+```
+
+Claude Code:
+
+```json
+{"method":"tools/call","params":{"name":"echo","arguments":{"text":"alpha"},"_meta":{"claudecode/toolUseId":"toolu_01JQ…","progressToken":5}},"jsonrpc":"2.0","id":5}
+```
+
+- **Bare tool name on the wire.** Both clients display a *prefixed* name to the
+  model (OpenCode shows `probe_echo` — single `_`, `server_tool`; Claude Code
+  shows `mcp__probe__echo`) but **strip their own prefix and send the bare
+  `echo`** to the upstream server. This is exactly the aggregator round-trip
+  GarmX implements: prefix client-facing, strip before forwarding upstream.
+- **`_meta.progressToken`** is attached by both, equal to the JSON-RPC request
+  `id`. Claude Code additionally attaches a namespaced **`claudecode/toolUseId`**
+  (its Anthropic `tool_use` id). GarmX must forward `_meta` transparently.
+- **Single monotonic `id` counter** across *all* request kinds (initialize,
+  every `list`, every `call`, and the re-fetch), starting at 0.
+
+### `notifications/tools/list_changed` — both clients RE-FETCH ✅
+
+This was the one genuine unknown driving `aggregator/notify.go`. **Both clients
+re-fetch immediately:**
+
+| | Latency: notification → `tools/list` re-fetch | Re-fetches what |
+|---|---|---|
+| OpenCode 1.17.15 | ~2 ms | `tools/list` only |
+| Claude Code 2.1.197 | ~6 ms | `tools/list` only |
+
+- Both re-requested `tools/list` within milliseconds and received the new
+  `echo`+`echo_v2` set — so an upstream tool-set change **does** propagate live
+  to a running client if GarmX forwards the notification.
+- The re-fetch is a **pure protocol-layer reaction**, independent of the agent
+  loop: Claude Code re-fetched *before the model had made any tool call*.
+- The notification is **tool-scoped**: neither client also re-pulled
+  `prompts/list` / `resources/list` on `tools/list_changed`.
+
+### Client quirks that GarmX's upstream/frontend must tolerate
+
+- **OpenCode sends `notifications/cancelled` after every *completed* call.**
+  Right after receiving each `tools/call` result, OpenCode emits
+  `{"method":"notifications/cancelled","params":{"requestId":N,"reason":"AbortError: The operation was aborted."}}`.
+  The request already succeeded — so GarmX must treat a cancellation for an
+  already-finished request id as a **no-op**, never as an error or a reason to
+  tear down the upstream call. Claude Code sends **no** such cancellation.
+- **No `ping`** was sent by either client during these sessions.
+
 ## Implications for GarmX (client-facing side)
 
 1. **Advertise/accept `2025-11-25`.** OpenCode requests the current spec version.
    GarmX's client-facing `initialize` should support it and, when it can, echo
    the client's requested version; lenient downgrade is tolerated but matching
    is cleaner.
-2. **Clients may consume only tools.** OpenCode's status path pulls only
-   `tools/list`. GarmX must still aggregate prompts/resources for clients that
-   use them, but tool aggregation is the must-have hot path.
-3. **`roots` is client-advertised.** A client may offer `roots`; GarmX's deferred
+2. **Tool aggregation is the hot path; prompts/resources are real too.** In a
+   full session OpenCode consumes **only** `tools/list`, but Claude Code eagerly
+   pulls `tools/list` + `prompts/list` + `resources/list` at startup. So tools
+   are the must-have, but GarmX **must** aggregate prompts and resources — at
+   least one first-target client discovers all three every session.
+3. **Forward `list_changed` — clients act on it.** Both clients re-fetch
+   `tools/list` within milliseconds of `notifications/tools/list_changed`
+   (tool-scoped; they do not re-pull prompts/resources). GarmX's
+   `aggregator/notify.go` propagation path is worth building: an upstream tool
+   change reaches a live client if GarmX forwards the notification. Debounce to
+   avoid storms, but the fan-out lands.
+4. **Pass `_meta` through and no-op stale cancellations.** `tools/call` carries
+   `_meta` (`progressToken`, plus Claude Code's `claudecode/toolUseId`); forward
+   it transparently upstream. OpenCode also emits `notifications/cancelled` for
+   *already-completed* calls — GarmX must treat a cancel for an unknown/finished
+   request id as a no-op.
+5. **`roots` is client-advertised.** A client may offer `roots`; GarmX's deferred
    server→client story means it won't call `roots/list` yet — fine, but the
    session model should record the client's advertised capabilities.
-4. **Config surface for tutorials:** the OpenCode "connect GarmX" tutorial is a
+6. **Config surface for tutorials:** the OpenCode "connect GarmX" tutorial is a
    one-block `opencode.json` with `type:"local"`, `command:["garmx","--stdio"]`.
 
 ---
@@ -177,9 +268,13 @@ client) so the deferred features can light up per-session later.
 Throwaway stdio MCP server used for all captures above. Self-contained (stdlib
 only). Rebuild with `go build -o probe .` in an empty dir containing this as
 `main.go` (and a `go mod init mcpprobe`). Logs every inbound line and every
-reply to `$MCPPROBE_LOG` (default `./mcpprobe.log`).
+reply to `$MCPPROBE_LOG` (default `./mcpprobe.log`). It replies enough to
+complete a connection and a full `tools/call`, and — ~2s after
+`notifications/initialized` — emits `notifications/tools/list_changed` and then
+serves a second tool `echo_v2`, so a client re-fetch is visible as a materially
+different `tools/list` response.
 
-Reproduce a capture:
+### Reproduce the status/health capture (initialize + `tools/list` only)
 
 - **OpenCode:** put `{"$schema":"https://opencode.ai/config.json","mcp":{"probe":
   {"type":"local","command":["/abs/probe"],"enabled":true,"environment":
@@ -188,11 +283,44 @@ Reproduce a capture:
 - **Claude Code:** `claude mcp add probe /abs/probe -e MCPPROBE_LOG=/abs/probe.log
   -s local` then `claude mcp list`, then `claude mcp remove probe -s local`.
 
+### Reproduce the real tool-calling session (prompts/resources, `tools/call`, `list_changed`)
+
+The session must stay open past the 2s notification timer — ask for several
+sequential tool calls.
+
+- **OpenCode against the local llama.cpp model.** Add a provider block pointing
+  at the OpenAI-compatible endpoint alongside the `mcp` block in `opencode.json`:
+
+  ```json
+  {
+    "provider": {
+      "llamacpp": {
+        "npm": "@ai-sdk/openai-compatible",
+        "options": { "baseURL": "http://localhost:8005/v1", "apiKey": "dummy" },
+        "models": { "qwen3-coder-next": { "name": "Qwen3 Coder Next" } }
+      }
+    }
+  }
+  ```
+
+  Then run (in that dir):
+  `opencode run "echo alpha, bravo, charlie, delta, foxtrot one at a time via the echo tool" --model llamacpp/qwen3-coder-next`.
+
+- **Claude Code, run normally** (real Anthropic model): after
+  `claude mcp add … -s local`, run headless with the tool pre-approved:
+  `claude -p "echo alpha, bravo, charlie, delta, foxtrot one at a time via the probe echo tool" --allowedTools mcp__probe__echo`,
+  then `claude mcp remove probe -s local`.
+
 ```go
-// Command mcpprobe is a throwaway stdio MCP server that logs the client
-// handshake. It replies just enough (initialize, tools/list, empty
-// prompts/resources, ping) to complete a connection, and appends every inbound
-// line and every reply to $MCPPROBE_LOG (default ./mcpprobe.log).
+// Command mcpprobe is a throwaway stdio MCP server used to capture a real
+// client session. It replies just enough to complete a connection and a full
+// tools/call round-trip, and — a short time after notifications/initialized —
+// emits notifications/tools/list_changed and then begins serving a *different*
+// tools/list. That lets us observe whether a real client re-fetches tools/list
+// on the notification.
+//
+// Every inbound line and every reply is appended to $MCPPROBE_LOG
+// (default ./mcpprobe.log).
 package main
 
 import (
@@ -200,8 +328,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 )
+
+// state tracks whether the mid-session tools/list_changed has fired yet, so
+// tools/list can serve a different set before and after. Guarded by mu, which
+// also serializes stdout writes across the scanner loop and the timer
+// goroutine.
+type state struct {
+	mu           sync.Mutex
+	toolsChanged bool
+}
 
 func main() {
 	logPath := os.Getenv("MCPPROBE_LOG")
@@ -215,18 +353,44 @@ func main() {
 	}
 	defer lf.Close()
 
+	st := &state{}
+
 	logline := func(dir, s string) {
 		fmt.Fprintf(lf, "%s %s %s\n", time.Now().Format(time.RFC3339Nano), dir, s)
 	}
 	logline("META", "==== mcpprobe started, args="+fmt.Sprint(os.Args[1:]))
 
 	out := bufio.NewWriter(os.Stdout)
+	// send serializes all stdout writes and their logging under st.mu so the
+	// list_changed timer goroutine cannot interleave with the scanner loop.
 	send := func(v any) {
 		b, _ := json.Marshal(v)
+		st.mu.Lock()
 		logline("SENT", string(b))
 		out.Write(b)
 		out.WriteByte('\n')
 		out.Flush()
+		st.mu.Unlock()
+	}
+
+	// toolsList returns the current tool set. Before list_changed only "echo"
+	// exists; after, a second tool "echo_v2" appears so a re-fetch is visible
+	// in the log as a materially different response.
+	toolsList := func() []any {
+		st.mu.Lock()
+		changed := st.toolsChanged
+		st.mu.Unlock()
+		tools := []any{map[string]any{
+			"name": "echo", "description": "Echoes its input back.",
+			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{"text": map[string]any{"type": "string"}}, "required": []any{"text"}},
+		}}
+		if changed {
+			tools = append(tools, map[string]any{
+				"name": "echo_v2", "description": "Echoes input back, twice (added mid-session).",
+				"inputSchema": map[string]any{"type": "object", "properties": map[string]any{"text": map[string]any{"type": "string"}}, "required": []any{"text"}},
+			})
+		}
+		return tools
 	}
 
 	sc := bufio.NewScanner(os.Stdin)
@@ -263,16 +427,24 @@ func main() {
 						"logging":   map[string]any{},
 					},
 					"serverInfo":   map[string]any{"name": "mcpprobe", "version": "0.0.1"},
-					"instructions": "Probe server for handshake capture.",
+					"instructions": "Probe server for handshake capture. Call the echo tool to test.",
 				},
 			})
+		case "notifications/initialized":
+			// Fire list_changed ~2s later, then flip the served tool set. A real
+			// agent session usually stays open long enough to see this.
+			go func() {
+				time.Sleep(2 * time.Second)
+				st.mu.Lock()
+				st.toolsChanged = true
+				st.mu.Unlock()
+				logline("META", "emitting notifications/tools/list_changed")
+				send(map[string]any{"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+			}()
 		case "tools/list":
 			send(map[string]any{
 				"jsonrpc": "2.0", "id": json.RawMessage(msg.ID),
-				"result": map[string]any{"tools": []any{map[string]any{
-					"name": "echo", "description": "Echoes its input back.",
-					"inputSchema": map[string]any{"type": "object", "properties": map[string]any{"text": map[string]any{"type": "string"}}},
-				}}},
+				"result": map[string]any{"tools": toolsList()},
 			})
 		case "prompts/list":
 			send(map[string]any{"jsonrpc": "2.0", "id": json.RawMessage(msg.ID), "result": map[string]any{"prompts": []any{}}})
@@ -299,8 +471,3 @@ func main() {
 	logline("META", "==== stdin closed, exiting")
 }
 ```
-
-> To capture `list_changed` next session, add a goroutine that, ~2s after
-> `notifications/initialized`, emits
-> `{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}` and then
-> serves a *different* `tools/list` — observe whether the client re-requests.

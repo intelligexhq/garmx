@@ -28,37 +28,38 @@ Tasks to progress GarmX. Design docs now live in `docs/`
 
 ## Start here next session
 
-**Deep-session handshake capture using the local llama.cpp Qwen Coder model**
-(free, no hosted-API budget). Point OpenCode's provider at the local endpoint,
-re-use the stdio probe pattern from `docs/research/client-handshakes.md`, and
-run a real `opencode run` session that invokes the probe's `echo` tool. Capture
-the still-unobserved behaviour:
+**Design spike — pin aggregation + version rules (discovery #2, #4).** The
+handshake research is now complete (both status-path and real tool-calling
+sessions captured — see below). Next: decide prefix length-budget threshold,
+eager page-merge vs cursor proxy, the supported client-side protocol version
+(evidence: **2025-11-25**), and upstream-mismatch behaviour. Encode as
+`aggregator/naming` + `capabilities` test cases. Key inputs now in hand:
 
-- `prompts/list` and `resources/list` — are they called in a real session?
-- a real `tools/call` round-trip (argument shape, result handling).
-- **`notifications/tools/list_changed`** — have the probe emit it mid-session
-  and confirm whether the client re-fetches `tools/list`. This is the one
-  genuine unknown that drives GarmX's notify/propagation path (aggregator
-  `notify.go`).
+- Both clients strip their own display prefix and call upstream with the **bare**
+  tool name → GarmX's prefix is purely client-facing; strip before forwarding.
+- Both re-fetch `tools/list` on `list_changed` within ms → build `notify.go`
+  propagation with debounce.
+- Claude Code consumes prompts + resources every session (OpenCode: tools only)
+  → aggregate all three primitives, not just tools.
+- OpenCode sends `notifications/cancelled` for completed calls → no-op stale
+  cancels in the frontend/upstream.
 
-Then repeat the key check against Claude Code. Fold results into
-`docs/research/client-handshakes.md` and `docs/discovery.md` #2.
-
-Reusable assets from this session live in the scratchpad (probe source +
-`opencode.json`/`.mcp.json` templates) — rebuild the probe with `go build` if
-the scratchpad was cleared.
+The probe (with mid-session `list_changed` emission) + `opencode.json` provider
+template live in the scratchpad; the full source is in the appendix of
+`docs/research/client-handshakes.md` — rebuild with `go build` if cleared.
 
 ## Next steps
 
 1. [x] **Phase 0 scaffolding.** Module, package dirs + `doc.go`, Makefile
    (`check` gate), `.golangci.yml`, CI, thin `cmd/garmx/main.go`. `make check`
    green.
-2. [x] **Handshake capture — core done** (discovery #1). OpenCode 1.17.13 and
-   Claude Code 2.1.203 initialize handshakes captured via a stdio probe; results
-   in `docs/research/client-handshakes.md`. Both request `2025-11-25`, negotiate
-   leniently, pull only `tools/list` on status. **Still open:** an authenticated
-   `opencode run` / Claude Code session to observe `prompts/list`,
-   `resources/list`, a real `tools/call`, and `list_changed` re-fetch.
+2. [x] **Handshake capture — done** (discovery #1). Both the status path
+   (OpenCode 1.17.x, Claude Code 2.1.x initialize + `tools/list`) and a real
+   tool-calling session (OpenCode on the local Qwen model; Claude Code on the
+   real model) captured in `docs/research/client-handshakes.md`. Confirmed:
+   lenient `2025-11-25` negotiation; bare-name upstream `tools/call`; both
+   re-fetch `tools/list` on `list_changed`; Claude Code pulls prompts+resources
+   per session (OpenCode tools-only); OpenCode's post-call `notifications/cancelled`.
 3. [ ] **Design spike — pin aggregation + version rules** (discovery #2, #4).
    Decide: prefix length-budget threshold, eager page-merge vs cursor proxy, the
    supported client-side protocol version (evidence says default **2025-11-25**),
