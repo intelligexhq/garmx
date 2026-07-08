@@ -17,6 +17,7 @@ local stdio MCP server, and what do they expect during `initialize`?
 GarmX must be a drop-in stdio MCP server for both.
 
 **Learn:**
+
 - Claude Code: `claude mcp add` flags and the `.mcp.json` / project config
   shape; how it launches the command; env passing; whether it supports
   `--stdio`-style args cleanly.
@@ -29,6 +30,7 @@ GarmX must be a drop-in stdio MCP server for both.
 Write the two tutorials from these captures.
 
 **Findings** (see `docs/research/client-handshakes.md` for raw evidence):
+
 - **Both clients captured.** Both request `protocolVersion` **2025-11-25**, use
   integer ids from 0, send `notifications/initialized`, negotiate **leniently**
   (accepted a server downgrade to 2025-06-18), and their status/health path
@@ -57,6 +59,7 @@ upstreams.
 **Why:** This is the core of the product (see architecture.md → aggregator).
 
 **Learn / decide:**
+
 - **Prefixing:** confirmed `server___tool` (AgentCore, triple underscore).
   Split on the **first** `___`. Enforce server-name regex so the split is
   unambiguous. Decide the exact length-budget warning threshold.
@@ -86,6 +89,7 @@ cases. Encode decisions as tests in `aggregator/naming` and `capabilities`.
 **not** implement.
 
 **Learn:**
+
 - The single MCP endpoint contract: `POST` for client→server; `GET`+SSE for
   the server→client stream; when the server may respond on the POST body vs
   the SSE stream.
@@ -109,6 +113,7 @@ different spec versions. How does it negotiate?
 GarmX; GarmX negotiates separately with each upstream.
 
 **Decide:**
+
 - The set of spec versions GarmX supports client-side (start with one current
   version).
 - Behaviour when an upstream only speaks an older/newer version: degrade,
@@ -120,6 +125,59 @@ GarmX; GarmX negotiates separately with each upstream.
 ---
 
 ## OPEN — resolve during implementation (mechanics, not architecture)
+
+### 4a. Registration & profile mechanics (decided in principle, pin the details)
+
+The *what* is decided (SQLite-as-truth, import, static profiles — see DECIDED).
+The remaining mechanics:
+
+- **Import parsers:** map Claude Code `.mcp.json` (`mcpServers.<name>`) and
+  OpenCode `opencode.json` (`mcp.<name>`) into the `servers` schema. Handle name
+  collisions on import, and secrets (env/headers) — import references or values?
+- **Tool pattern matching:** the profile `tool_allow`/`tool_deny` grammar. Glob
+  (`github___*`, `*___delete_*`) is likely enough — confirm no need for regex.
+  Precedence when a name matches both allow and deny (deny wins).
+- **Per-profile merged view:** cache key includes the profile; confirm the
+  rebuild-on-`list_changed` path (`notify.go`) fans out per session's profile,
+  not once globally. Watch the prefix length budget per profile.
+- **Profile selection over stdio:** `--profile <name>` flag; behaviour when the
+  named profile doesn't exist (fail loud vs fall back to default-all).
+- **Export redaction:** `garmx export` must not inline raw secrets.
+
+### 4b. Shared-daemon & stdio-shim mechanics
+
+The *what* is decided (one daemon; `--stdio` is a shim). The mechanics:
+
+- **Shim↔daemon channel:** local domain socket vs the loopback HTTP face. The
+  shim must be a transparent byte/JSON-RPC relay so the client sees an ordinary
+  stdio MCP server.
+- **Daemon lifecycle:** who starts it, auto-start-on-demand from the shim,
+  single-instance locking (one daemon per user/socket), and behaviour when the
+  daemon dies mid-session (shim reconnect vs fail the session).
+- **`:9735` ownership:** served by the daemon only; the shim never binds it.
+- **Per-session state in a shared process:** the session registry now holds many
+  concurrent clients; confirm the per-profile merged-view cache and the
+  `list_changed` fan-out are keyed per session, not global.
+
+### 4c. Observability & export mechanics
+
+Decided in principle (emit-don't-rebuild; OTLP; minimal UI — see DECIDED). Pin:
+
+- **Client attribution:** raw unit = session; UI grouping = profile + client app
+  (`clientInfo`). Confirm this is enough, or whether an explicit connect-time
+  label is needed (two Claude Code windows are otherwise indistinguishable).
+- **Audit payload cap:** the size threshold, the truncation marker, and what
+  metadata is always retained; retention policy (max age / rows) and its
+  enforcement (periodic sweep vs on-write).
+- **Metric cardinality:** the exact label set (`server`/`tool`/`status`/?);
+  keep session id out of metric labels. Derive UI stats from `audit_logs` with
+  indexes, or add rollup tables only if query cost demands.
+- **OTLP wiring:** exporter config (endpoint, headers, TLS); which signals are
+  on by default (metrics) vs opt-in per destination (logs/traces); redaction
+  applied upstream of the export fork.
+- **Dependency check:** OTLP export likely pulls `go.opentelemetry.io/otel*` —
+  weigh against the "can I write it in <100 lines?" rule (a hand-rolled OTLP/HTTP
+  metrics emitter may be leaner than the full SDK for v1).
 
 ### 5. Go child-process lifecycle (stdio upstreams)
 
@@ -146,6 +204,7 @@ prepared statements for hot queries.
 ### 8. Security posture
 
 The daemon holds every upstream's credentials — treat it accordingly:
+
 - **Redact on the write path:** secrets in audit payloads (`env`/`headers`
   values, and configurable body patterns: `password`, `token`, `apiKey`,
   `authorization`).
@@ -179,6 +238,10 @@ leaks," verified with a leak-checking `TestMain` and a synthetic-traffic client.
 | Upstream transports | **stdio + Streamable HTTP.** |
 | Name collisions | **`server___tool` prefixing** (AgentCore pattern). |
 | Server→client callbacks | **Deferred in v1**; session model keeps the back-ref so it's a later extension, not a rewrite. |
+| Registration source of truth | **SQLite is authoritative.** Config file is a one-directional seed/import, not a live mirror; no continuous file↔DB sync. `garmx import` adopts existing Claude Code / OpenCode configs; `garmx export` for backup. |
+| Access control (v1) | **Static profiles** — named server+tool subsets, selected at launch (`--profile`) over stdio. Default = expose everything. Curation-first; no RBAC engine until the HTTP daemon supplies real per-agent identity. |
+| Process model | **One shared long-lived daemon.** It holds all upstreams, credentials, catalog, and audit store; `garmx serve --stdio` is a thin shim proxying to it (auto-starting it if absent). Not a per-client instance. The single vantage point that makes the observability plane possible. |
+| Observability | **Emit, don't rebuild Grafana.** GarmX owns the raw audit trail (SQLite) + a minimal built-in UI, and exports via **OTLP** (metrics/logs/traces) to the Grafana family. It does not reimplement trends/alerting/retention. Redaction precedes both write and export; metrics export by default, logs/traces opt-in; audit payloads size-capped with retention. |
 
 ---
 

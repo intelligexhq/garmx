@@ -49,7 +49,7 @@ Project-local `opencode.json` (also honored: `~/.config/opencode/opencode.json`,
 
 ### Method sequence observed
 
-```
+```text
 → initialize                      (id: 0)
 ← initialize result               (we replied protocolVersion 2025-06-18)
 → notifications/initialized       (no id)
@@ -180,6 +180,7 @@ only). Rebuild with `go build -o probe .` in an empty dir containing this as
 reply to `$MCPPROBE_LOG` (default `./mcpprobe.log`).
 
 Reproduce a capture:
+
 - **OpenCode:** put `{"$schema":"https://opencode.ai/config.json","mcp":{"probe":
   {"type":"local","command":["/abs/probe"],"enabled":true,"environment":
   {"MCPPROBE_LOG":"/abs/probe.log"}}}}` as `opencode.json` in a dir, run

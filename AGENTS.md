@@ -4,26 +4,28 @@
 
 After every code change, before considering the work done, run:
 
-```
+```text
 make check
 ```
 
-This runs, in order and failing fast: `fmt` (gofumpt) → `lint`
-(golangci-lint) → `vet` (go vet) → `test` (`go test -race -count=1 ./...`) →
-`build`. It must pass with zero errors. Do **not** move on, commit, or report a
-task complete while `make check` is red.
+This runs, in order and failing fast: `fmt-check` (gofumpt) → `lint-md`
+(Markdown) → `lint` (golangci-lint) → `vet` (go vet) → `test`
+(`go test -race -count=1 ./...`) → `build`. It must pass with zero errors. Do
+**not** move on, commit, or report a task complete while `make check` is red.
 
 Individual targets (use while iterating; `make check` is the gate):
 
 | Command | What it validates |
 |---------|-------------------|
-| `make fmt`   | Formatting is canonical (`gofumpt`). |
-| `make lint`  | Static analysis passes (`golangci-lint`). |
-| `make vet`   | `go vet` finds no suspicious constructs. |
-| `make test`  | All tests pass under the race detector. |
-| `make build` | The binary compiles. |
-| `make templ` | `.templ` files regenerate (run before build once UI exists). |
+| `make fmt`     | Formatting is canonical (`gofumpt`). |
+| `make lint-md` | Markdown is canonical (see "Markdown standards"). |
+| `make lint`    | Static analysis passes (`golangci-lint`). |
+| `make vet`     | `go vet` finds no suspicious constructs. |
+| `make test`    | All tests pass under the race detector. |
+| `make build`   | The binary compiles. |
+| `make templ`   | `.templ` files regenerate (run before build once UI exists). |
 
+If `make lint-md` fails, run `make fmt-md` to auto-fix Markdown formatting.
 If you change `.templ` files, run `make templ` before `make check`.
 
 Rule: **a change is not finished until `make check` is green.**
@@ -60,6 +62,7 @@ func (t *stdioTransport) Start() error { ... }
 ```
 
 Rules:
+
 - **First word** of the comment is the identifier name being documented
   (Go convention).
 - **Exported** types, funcs, consts, vars, and package declarations require
@@ -77,6 +80,7 @@ Rules:
   `docs/implementation.md` and `todo.md`.
 
 ### Comment quality checklist
+
 - [ ] Does this comment explain *why* this code exists, not just *what* it
       does?
 - [ ] Does it mention any invariants, preconditions, or side effects?
@@ -91,6 +95,7 @@ Rules:
 ## Go Project Best Practices
 
 ### Project Layout
+
 - Follow the standard Go project layout: `cmd/` for binaries, `internal/`
   for private packages, `pkg/` for shared/public packages.
 - Keep `main.go` thin — parse flags, load config, wire dependencies, start
@@ -103,6 +108,7 @@ Rules:
   endpoints).
 
 ### Code Style
+
 - Run `gofumpt` (stricter version of `go fmt`) before every build.
 - Use `go vet` as a pre-flight check — catches subtle bugs (e.g.,
   `*errors.New` misuses).
@@ -116,6 +122,7 @@ Rules:
 - Avoid `init()` functions. Use explicit constructors (e.g., `NewHub`).
 
 ### Concurrency
+
 - Use goroutines + channels for communication. Avoid `sync.Mutex` where
   channels suffice.
 - When using `sync.Mutex`, document what it protects.
@@ -132,6 +139,7 @@ Rules:
   channel. Concurrent in-flight requests to one upstream otherwise misdeliver.
 
 ### Error Handling
+
 - Check errors. Never use `_` to discard an error unless you've consciously
   decided it's safe (and document why).
 - Return early, nest minimally. Avoid `if err == nil { ... } else { ... }`
@@ -141,6 +149,7 @@ Rules:
 - Wrap external errors with context: `fmt.Errorf("reading config: %w", err)`.
 
 ### SQLite
+
 - Always use parameterized queries (`?` placeholders). Never string
   interpolation for SQL values.
 - Use WAL mode (`PRAGMA journal_mode=WAL`) for concurrent read/write.
@@ -151,7 +160,9 @@ Rules:
   handle to one connection.
 
 ### Testing
+
 - **Table-driven tests** for all logic-heavy functions. Example:
+
   ```go
   func TestRoute(t *testing.T) {
       tests := []struct {
@@ -164,6 +175,7 @@ Rules:
       for _, tt := range tests { t.Run(tt.name, func(t *testing.T) { ... }) }
   }
   ```
+
 - Use `t.Cleanup()` for resource cleanup, not defer (avoids shadowing bugs).
 - Name test functions `TestXxx` for unit tests. Use build tags for
   integration tests (`//go:build integration`).
@@ -175,6 +187,7 @@ Rules:
 - Test error paths, not just happy paths.
 
 ### Dependencies
+
 - Keep `go.mod` lean. Before adding a dependency, ask: "Can I write this
   myself in <100 lines?"
 - Prefer stdlib solutions (`slog`, `net/http`, `database/sql`,
@@ -192,6 +205,7 @@ Targets must be run (in order) before every push/PR:
 | Command | What it does |
 |---------|-------------|
 | `make fmt` | Run `gofumpt` on all Go files |
+| `make lint-md` | Check Markdown is canonical (`tools/mdlint`) |
 | `make lint` | Run `golangci-lint` |
 | `make vet` | Run `go vet ./...` |
 | `make test` | Run `go test -race -count=1 ./...` |
@@ -202,6 +216,7 @@ Additional targets:
 
 | Command | What it does |
 |---------|-------------|
+| `make fmt-md` | Rewrite Markdown files to canonical form |
 | `make dev` | Rebuild + run on file changes (uses `entr`) |
 | `make clean` | Remove build artifacts |
 | `make templ` | Regenerate Templ (`.templ.go`) files |
@@ -211,10 +226,28 @@ The CI pipeline must run `make check` as its main step.
 
 ---
 
+## Markdown standards
+
+All `*.md` files are formatted by `tools/mdlint`, an in-repo, dependency-free
+Go normalizer invoked via `go run` (no Node required). `make lint-md` fails the
+gate if any file is not canonical; `make fmt-md` rewrites them. It enforces:
+
+- blank lines around ATX headings, top-level lists, and fenced code blocks;
+- a language token on every opening code fence (defaults to `text`);
+- no trailing whitespace and no consecutive blank lines outside code;
+- exactly one trailing newline.
+
+Content inside fenced code blocks is preserved verbatim. Keep docs as a
+snapshot of current design — no changelog-style history or references to
+superseded drafts; update the text in place.
+
+---
+
 ## Pre-commit Checklist
 
 Before committing:
-1. `make check` passes (fmt → lint → vet → test → build)
+
+1. `make check` passes (fmt-check → lint-md → lint → vet → test → build)
 2. No `TODO` or `FIXME` remain in changed files
 3. No commented-out code in changed files
 4. New exported identifiers have doc comments

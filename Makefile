@@ -17,13 +17,15 @@ LDFLAGS := -ldflags "-X main.version=$(VERSION)"
 GOFUMPT      := go run mvdan.cc/gofumpt@$(GOFUMPT_VERSION)
 GOLANGCI_LINT := go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 TEMPL        := go run github.com/a-h/templ/cmd/templ@$(TEMPL_VERSION)
+# In-repo Markdown normalizer (see tools/mdlint); no version pin — it is source.
+MDLINT       := go run ./tools/mdlint
 
 .DEFAULT_GOAL := check
 
-.PHONY: check fmt fmt-check lint vet test build templ run dev clean coverage tidy tools-help
+.PHONY: check fmt fmt-check fmt-md lint lint-md vet test build templ run dev clean coverage tidy tools-help
 
-## check: full validation gate — fmt-check → lint → vet → test → build.
-check: fmt-check lint vet test build
+## check: full validation gate — fmt-check → lint-md → lint → vet → test → build.
+check: fmt-check lint-md lint vet test build
 
 ## fmt: format all Go files with gofumpt.
 fmt:
@@ -36,6 +38,14 @@ fmt-check:
 		echo "not gofumpt-formatted:"; echo "$$out"; \
 		echo "run 'make fmt'"; exit 1; \
 	fi
+
+## fmt-md: rewrite Markdown files to canonical form.
+fmt-md:
+	$(MDLINT) -fix .
+
+## lint-md: fail if any Markdown file is not canonical (used by check/CI).
+lint-md:
+	$(MDLINT) .
 
 ## lint: run golangci-lint.
 lint:

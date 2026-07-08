@@ -2,11 +2,14 @@
 
 ## Overview
 
-GarmX is a local-first **MCP aggregating gateway** with a built-in server
-catalog and web UI. It runs as a single Go binary. To an AI client it presents
+GarmX is a local-first **MCP registry and aggregating gateway** with a built-in server
+catalog and web UI. It runs as a single Go binary. To any AI client it presents
 itself as **one** MCP server; behind that facade it fans requests out to many
 registered upstream MCP servers, merges their capabilities, and routes tool
 calls to the correct upstream.
+
+One of the key value adds - GarmX provides tracebility, audit and observability of all mcp tool usage.
+Supports full observability OTEL exporting to any relevant analytics platform.
 
 The mental model that matters:
 
@@ -26,7 +29,7 @@ GarmX has a **client-facing** side (what an AI client connects to) and an
 **upstream-facing** side (how GarmX reaches the real MCP servers). Both sides
 speak MCP, in both transports.
 
-```
+```text
         CLIENT-FACING                         UPSTREAM-FACING
   ┌───────────────────────┐            ┌────────────────────────────┐
   │ Claude Code / OpenCode │            │  registered MCP servers    │
@@ -61,13 +64,38 @@ two: the UI is for a human on `:9735`; the MCP endpoint is for an AI client.
 
 ---
 
+## Process model: one shared daemon
+
+GarmX runs as a **single long-lived daemon**, not a fresh instance per client.
+One daemon owns all upstream MCP servers, their credentials, the SQLite
+catalog + audit store, and the management UI on `:9735`. Every client
+connection is a **session** against that one daemon.
+
+This is deliberate and load-bearing:
+
+- **One copy of each upstream.** N connected clients share the same upstream
+  processes/connections, not N× duplicates.
+- **A single collection point.** All client→MCP traffic converges in one
+  process, which is what makes the audit/observability plane possible (see
+  "Observability & export"). Per-client instances would fragment telemetry and
+  each try to bind `:9735`.
+- **Register once, visible everywhere.** A server registered through any door
+  is immediately part of the aggregate for every session (subject to the
+  session's profile).
+
+The stdio face therefore does **not** boot its own daemon: `garmx serve
+--stdio` is a **thin shim** that proxies the client's stdio JSON-RPC to the
+running daemon over a local channel, starting the daemon on demand if none is
+running. The daemon is the single holder of state; the shim is stateless.
+
 ## Client connection model
 
 ### stdio (v1 primary — Claude Code, OpenCode)
 
-The client's config launches `garmx` as a subprocess and speaks
-newline-delimited JSON-RPC over the process's stdin/stdout. GarmX is, from the
-client's point of view, an ordinary local stdio MCP server.
+The client's config launches `garmx serve --stdio` as a subprocess and speaks
+newline-delimited JSON-RPC over its stdin/stdout. GarmX is, from the client's
+point of view, an ordinary local stdio MCP server; behind the shim the
+conversation is handled by the shared daemon.
 
 Example (`claude mcp add`-style / `.mcp.json`):
 
@@ -79,8 +107,9 @@ Example (`claude mcp add`-style / `.mcp.json`):
 }
 ```
 
-When launched in `--stdio` mode GarmX still starts its management HTTP server
-(so the UI works), but the MCP conversation happens over stdio, not HTTP.
+The management UI is served by the **daemon**, once, on `:9735` — not by each
+stdio shim. A client that wants a specific scope passes `--profile <name>`
+in its `args` (see "Profiles / access scoping").
 
 ### streamable-http (v1 secondary)
 
@@ -119,7 +148,7 @@ running GarmX as a shared local daemon.
 Tool and prompt names are prefixed with the **registered server name** using a
 **triple-underscore** delimiter, matching AgentCore Gateway:
 
-```
+```text
 <serverName>___<toolName>
 e.g.  postgres___query      github___create_issue
 ```
@@ -150,7 +179,7 @@ by JSON-RPC `id`, never by "next message off the channel."
 
 Each upstream owns a `pending` map:
 
-```
+```text
 map[requestID]chan *mcp.Response
 ```
 
@@ -162,7 +191,9 @@ The read loop dispatches each inbound message:
   method-not-supported error);
 - has no `id` (a **notification**) → hand to the notification router.
 
-This eliminates the response-misdelivery race in the original design.
+Matching by `id` keeps responses correctly delivered under concurrent
+in-flight requests; delivering "the next message off the channel" would
+misroute them.
 
 ---
 
@@ -185,9 +216,145 @@ rewrite**.
 
 ---
 
+## Registration & source of truth
+
+Servers enter the catalog through several front doors, but there is exactly
+**one authoritative store: SQLite.** Everything else is a way to write into it.
+
+> **SQLite is the runtime source of truth.** The config file is a
+> one-directional *seed/import*, never a live mirror. There is no continuous
+> file↔DB sync (that path is an edit-race and secret-drift tar pit).
+
+Registration paths:
+
+| Path | Verb | Notes |
+|------|------|-------|
+| **REST + HTMX UI** | `POST/PUT/DELETE /api/servers` | Live mutation; the human-facing default. |
+| **CLI** | `garmx server add/rm/ls` | Thin wrapper over the same registry package; used by the tutorials. |
+| **Config seed** | `garmx serve --config garmx.jsonc` | On first run, import listed servers into SQLite if absent. Not re-read as truth afterward. |
+| **Import (adopt)** | `garmx import <path>` | Parse an existing client config — Claude Code `.mcp.json` (`mcpServers.<name>`) or OpenCode `opencode.json` (`mcp.<name>`) — and register its servers. The primary onboarding flow: sweep the servers already scattered across a user's clients into GarmX, then repoint each client at just `garmx`. |
+| **Export** | `garmx export <path>` | Serialize the DB back to a JSONC file for backup/portability (secrets masked or referenced, never inlined verbatim). |
+| **Public MCP Registry** | *(later)* | Optional discovery source (`registry.modelcontextprotocol.io`) — browse-and-add. Distinct from GarmX's own local catalog. |
+| **Agent self-registration** | *(deferred, gated)* | A `garmx___register_server` meta-tool would let an agent add servers — but that grants arbitrary command execution. Not in v1; behind an explicit opt-in flag if ever. |
+
+Import is an **explicit verb**, not a watcher. `--config` seeds once; after that
+the DB wins. This is what makes live UI/REST/CLI registration coherent — runtime
+mutation is first-class, so the store that the daemon mutates must be
+authoritative.
+
+---
+
+## Profiles / access scoping
+
+By default GarmX exposes **every enabled server and every tool** to whoever
+connects — no cost to users who don't want scoping. On top of that, a **profile**
+is a named subset of the aggregate that a given client sees.
+
+The framing is **curation first, security second.** The main value is that a
+focused toolset (the 12 relevant tools, not all 140) improves agent tool
+selection and cuts per-turn token cost; hiding destructive tools (a `read-only`
+profile) is a secondary safety benefit.
+
+```text
+profile "coding" = {
+  servers: [github, postgres, filesystem],
+  tools:   allow ["github___*", "postgres___query"], deny ["*___delete_*"]
+}
+```
+
+**Identity is transport-bound — this is the load-bearing constraint:**
+
+- **stdio (v1 primary):** GarmX is launched as a subprocess by exactly *one*
+  client, with *no* authentication. There is no runtime principal to enforce
+  against, so access control is a **launch-time selection**:
+  `garmx serve --stdio --profile coding`. The invocation *is* the identity.
+- **Streamable HTTP shared daemon (later):** multiple sessions with real
+  MCP OAuth2/bearer identity. Here a **token → profile** mapping yields genuine
+  per-agent RBAC. This is the *only* place "which agent can access which MCP"
+  becomes enforceable — so it waits for that face.
+
+v1 ships **static profiles** only — no roles, inheritance, or policy DSL. Those
+are premature while the enforceable-identity story doesn't exist yet.
+
+**Architecture impact — the merged view becomes per-profile, not global:**
+
+- `tools/list` / `prompts/list` caching is keyed by profile.
+- The prefix length budget is evaluated per profile.
+- `list_changed` fan-out targets each session according to its profile.
+- Newly-appeared tools (via `list_changed`) need a per-profile default:
+  allow (friendlier) vs deny (safer). Decided per profile.
+- The session row records its profile, so the audit trail gains
+  "which profile called what" for free.
+
+---
+
+## Observability & export
+
+Beyond aggregation, GarmX's value is that **every client→MCP transaction flows
+through one process** — so it can be captured, attributed per client, shown in a
+minimal UI, and exported to external systems. This is the differentiator, and
+the shared-daemon model exists largely to enable it.
+
+### Guiding principle: emit, don't rebuild Grafana
+
+GarmX owns the **raw audit trail** (SQLite) and a **deliberately minimal**
+built-in UI. It does **not** reimplement historical trends, alerting, long
+retention, or cross-service correlation — those are delegated to the Grafana
+family via export. If the built-in UI starts wanting time-range pickers and
+stacked charts, that is the signal it belongs in Grafana, fed by the exporter.
+
+```text
+client ──stdio shim──► GarmX daemon ──► upstreams
+                          │
+                          ├─ audit (redacted, size-capped) ─► SQLite ─► minimal UI (stat tiles, live log)
+                          │                                       └─ WebSocket live stream
+                          └─ OTLP exporter ─► metrics (default) ─────┐
+                                              logs / traces (opt-in) ─┴─► OTel Collector ─► Prometheus / Loki / Tempo / Grafana
+```
+
+### Built-in UI (minimal, on `:9735`)
+
+A few stat tiles (calls, error rate, p50/p95 latency per server), a top-tools
+list, per-client / per-profile counts, and the live log stream. These derive
+from `audit_logs` with indexed queries — **no separate metrics store** until
+query cost demands one. (Chart/tile work pulls in the dataviz guidance so the
+UI reads as one system.)
+
+### Export: OpenTelemetry (OTLP), not point integrations
+
+GarmX emits **OTLP** — one protocol carrying three signals — and lets the OTel
+Collector / Grafana Alloy fan out to any backend (vendor-neutral, not
+Grafana-locked). Signal mapping:
+
+| Signal   | GarmX source                                                    | Typical backend |
+|----------|-----------------------------------------------------------------|-----------------|
+| Traces   | each `tools/call` as a span: client → garmx → upstream, with tool/server/latency/error | Tempo |
+| Metrics  | counters (calls, errors) + latency histograms, bounded labels   | Prometheus |
+| Logs     | the audit payloads                                              | Loki |
+
+### Non-negotiable constraints (see discovery for open mechanics)
+
+- **Redaction happens before the fork**, not before display. Both the SQLite
+  write *and* the export path are downstream of redaction — export is a new
+  secret-egress path.
+- **Tiered export by privacy.** Metrics (counts/latency) are safe by default;
+  **logs and traces carry real tool arguments and results** (query outputs,
+  file contents) and are **opt-in per destination**, redacted.
+- **Audit payloads are size-capped.** Tool results can be multi-MB; store
+  metadata always, truncate/omit large bodies with a marker, and enforce
+  retention (max age / rows). Never let the audit DB grow unbounded.
+- **Bounded metric cardinality.** Label metrics by `server` / `tool` / `status`
+  (and maybe client-app); keep high-cardinality ids (session id) in
+  logs/traces, never in metric labels.
+- **Client attribution.** The raw unit is the session; the UI groups by
+  **profile + client app** (`clientInfo`), since stdio gives no stronger
+  identity than that. See discovery for the open decision.
+
+---
+
 ## Module / Package Layout
 
-```
+```text
 garmx/
 ├── cmd/
 │   └── garmx/
@@ -223,6 +390,8 @@ garmx/
 │   ├── audit/
 │   │   ├── audit.go             # Async batched audit writer
 │   │   ├── store.go             # SQLite persistence for audit logs
+│   │   ├── redact.go            # Redaction on the write path (before store + export)
+│   │   ├── export.go            # OTLP exporter: metrics (default), logs/traces (opt-in)
 │   │   └── stream.go            # WebSocket emitter for the live UI
 │   │
 │   ├── health/
@@ -250,14 +419,13 @@ garmx/
 └── docs/  (architecture.md, implementation.md, discovery.md)
 ```
 
-Notes on the rename from the earlier draft:
+Layout rationale:
 
-- `pkg/jsonrpc` → **`pkg/mcp`**: we need typed MCP method params/results
-  (initialize, tools, resources, prompts), not just a minimal id/method
-  scraper. The minimal-parse helper still lives here for the hot path.
-- `internal/gateway` → split into **`aggregator`** (protocol logic),
+- **`pkg/mcp`** holds typed MCP method params/results (initialize, tools,
+  resources, prompts) plus a minimal-parse helper for the hot path.
+- The three core concerns stay separate: **`aggregator`** (protocol logic),
   **`upstream`** (transports to real servers), and **`frontend`**
-  (client-facing endpoints). The old design folded all three into one "hub."
+  (client-facing endpoints).
 
 ---
 
@@ -265,7 +433,7 @@ Notes on the rename from the earlier draft:
 
 ### 1. `tools/list` (aggregation path — synthesized, not forwarded)
 
-```
+```text
 Client                        GarmX aggregator                 Upstreams
   │  tools/list                    │                               │
   │ ─────────────────────────────► │  fan out tools/list ─────────►│ (pg)
@@ -281,7 +449,7 @@ Client                        GarmX aggregator                 Upstreams
 
 ### 2. `tools/call` (pass-through path — routed by tool name)
 
-```
+```text
 Client                        GarmX aggregator                 Upstream (pg)
   │  tools/call                    │                               │
   │  name="pg___query"             │                               │
@@ -298,7 +466,7 @@ Client                        GarmX aggregator                 Upstream (pg)
 
 ### 3. Registry CRUD (management path)
 
-```
+```text
 Browser                          GarmX (api)                    SQLite
   │ POST /api/servers               │                             │
   │ {name,command,args,env,          │  validate (name regex,     │
@@ -312,7 +480,7 @@ Browser                          GarmX (api)                    SQLite
 
 ### 4. Health / list-changed
 
-```
+```text
 health.go (ticker 30s)                upstream notification
   ├─ stdio:  process alive?           notifications/tools/list_changed
   │          + optional ping          │
@@ -365,7 +533,9 @@ CREATE TABLE audit_logs (
     direction   TEXT NOT NULL,                -- 'client_in'|'upstream_out'|'upstream_in'|'client_out'
     method      TEXT,
     rpc_id      TEXT,
-    raw_payload TEXT NOT NULL,                -- redacted before write (see security)
+    raw_payload TEXT,                         -- redacted before write; NULL/truncated if over cap
+    payload_bytes INTEGER,                    -- original size before any truncation
+    truncated   INTEGER NOT NULL DEFAULT 0,   -- 1 if raw_payload was capped (see Observability)
     latency_ms  INTEGER,
     error_code  INTEGER,
     created_at  TEXT NOT NULL DEFAULT (datetime('now'))
@@ -374,12 +544,25 @@ CREATE INDEX idx_audit_created ON audit_logs(created_at);
 CREATE INDEX idx_audit_server  ON audit_logs(server_id);
 CREATE INDEX idx_audit_session ON audit_logs(session_id);
 
+-- Profiles: named subsets of the aggregate exposed to a client
+CREATE TABLE profiles (
+    name         TEXT PRIMARY KEY,            -- selected via --profile / token map
+    description  TEXT,
+    servers      TEXT NOT NULL DEFAULT '[]',  -- JSON array of server names ([] = all enabled)
+    tool_allow   TEXT NOT NULL DEFAULT '[]',  -- JSON array of exposed-name patterns ([] = all)
+    tool_deny    TEXT NOT NULL DEFAULT '[]',  -- JSON array of exposed-name patterns
+    default_new  TEXT NOT NULL DEFAULT 'allow',-- 'allow'|'deny' for tools appearing via list_changed
+    created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- Client sessions
 CREATE TABLE sessions (
     id               TEXT PRIMARY KEY,
     client_info      TEXT,                    -- name/version from initialize
     protocol_version TEXT,
     transport        TEXT,                    -- 'stdio' | 'streamable-http'
+    profile          TEXT REFERENCES profiles(name), -- scoping applied to this session
     started_at       TEXT NOT NULL DEFAULT (datetime('now')),
     ended_at         TEXT
 );
@@ -433,7 +616,7 @@ These carry MCP JSON-RPC only. There is **no** bespoke `/json-rpc` endpoint.
 
 ## UI Component Hierarchy (HTMX + Templ)
 
-```
+```text
 layout.templ (shell — nav, main)
 ├── dashboard.templ      → ServerStatusCards, TrafficSummary, RecentLog
 ├── servers.templ        → ServerTable → ServerRow, AddServerForm
@@ -462,3 +645,9 @@ header). WebSocket is used **only** for the live log stream.
 | **HTMX + Templ, embedded assets, single binary** | Zero JS-framework overhead; type-safe templates; one `go build`. |
 | **Redact secrets before audit write** | `env`/`headers`/tool args can carry credentials; redaction happens on the write path, not at display time only. |
 | **Bind `127.0.0.1` by default** | The daemon holds every upstream's credentials; never expose it on `0.0.0.0` without explicit opt-in. |
+| **SQLite is the registration source of truth** | Config file is a one-directional seed/import, not a live mirror; continuous file↔DB sync is an edit-race/secret-drift tar pit. Live UI/REST/CLI mutation is first-class, so the mutated store must win. |
+| **`garmx import` adopts existing client configs** | The onboarding lever for "central point of MCP consumption": sweep servers already scattered across Claude Code / OpenCode configs into GarmX, then repoint clients at GarmX alone. |
+| **Static profiles, curation-first** | Over stdio there's one unauthenticated client per process — no runtime principal to enforce against, so scoping is a launch-time `--profile` selection. Real per-agent RBAC waits for the HTTP daemon's token identity. Default exposes everything. |
+| **One shared daemon; stdio is a thin shim** | A single process holds all upstreams, credentials, and the audit store — the one vantage point where all client→MCP traffic converges. Per-client instances would duplicate upstreams, fragment telemetry, and collide on `:9735`. |
+| **Observability plane: emit, don't rebuild Grafana** | GarmX owns the raw audit trail + a minimal built-in UI, and exports via OTLP (metrics/logs/traces) to the Grafana family. It does not reimplement trends/alerting/retention. This audit+export plane is the differentiator beyond aggregation. |
+| **Redact before the export fork; tier by privacy** | Redaction precedes both the SQLite write and export. Metrics export by default; logs/traces carry real tool args/results and are opt-in per destination. Audit payloads are size-capped with retention. |

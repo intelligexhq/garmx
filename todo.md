@@ -4,24 +4,43 @@ Tasks to progress GarmX. Design docs now live in `docs/`
 (`architecture.md`, `implementation.md`, `discovery.md`).
 
 ## Done
+
 - [x] Run the plan through review; split and rewrite into
       `docs/architecture.md`, `docs/discovery.md`, `docs/implementation.md`.
 - [x] Correct the core model: aggregator (not byte pipe), `server___tool`
       prefixing, Streamable HTTP (drop legacy SSE), stdio-first client face.
 - [x] Reconcile `AGENTS.md` with the new package layout.
+- [x] Capture **registration flow** (SQLite as source of truth + `garmx import`
+      to adopt existing client configs) and **access scoping** (static,
+      curation-first `--profile` subsets) in `docs/architecture.md`; decisions in
+      `docs/discovery.md` (DECIDED) with remaining mechanics as OPEN #4a.
+- [x] Reconcile `docs/implementation.md` with the daemon/shim, registration,
+      profiles, and observability decisions; scrub historical references from
+      the docs (snapshot of current thinking only). Add an in-repo Markdown
+      linter (`tools/mdlint`, no Node) wired into `make check` via `lint-md`;
+      `make fmt-md` auto-fixes. All docs normalized.
+- [x] Decide **process model** (one shared daemon; `--stdio` is a thin shim) and
+      the **observability & export plane** (raw audit in SQLite + minimal UI +
+      OTLP export to the Grafana family; emit-don't-rebuild; redact-before-fork;
+      tiered export; size-capped payloads). Folded into `docs/architecture.md`
+      ("Process model", "Observability & export") and `docs/discovery.md`
+      (DECIDED + OPEN #4b/#4c).
 
 ## Start here next session
+
 **Deep-session handshake capture using the local llama.cpp Qwen Coder model**
 (free, no hosted-API budget). Point OpenCode's provider at the local endpoint,
 re-use the stdio probe pattern from `docs/research/client-handshakes.md`, and
 run a real `opencode run` session that invokes the probe's `echo` tool. Capture
 the still-unobserved behaviour:
+
 - `prompts/list` and `resources/list` — are they called in a real session?
 - a real `tools/call` round-trip (argument shape, result handling).
 - **`notifications/tools/list_changed`** — have the probe emit it mid-session
   and confirm whether the client re-fetches `tools/list`. This is the one
   genuine unknown that drives GarmX's notify/propagation path (aggregator
   `notify.go`).
+
 Then repeat the key check against Claude Code. Fold results into
 `docs/research/client-handshakes.md` and `docs/discovery.md` #2.
 
@@ -30,6 +49,7 @@ Reusable assets from this session live in the scratchpad (probe source +
 the scratchpad was cleared.
 
 ## Next steps
+
 1. [x] **Phase 0 scaffolding.** Module, package dirs + `doc.go`, Makefile
    (`check` gate), `.golangci.yml`, CI, thin `cmd/garmx/main.go`. `make check`
    green.
@@ -48,5 +68,6 @@ the scratchpad was cleared.
    acceptance gate, informed by the captures above.
 
 ## Later
+
 - Short blog / X posts: the goal (unified local MCP gateway) and the "why."
 - First two tutorials: connecting Claude Code and OpenCode to GarmX.
