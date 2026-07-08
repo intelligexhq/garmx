@@ -9,13 +9,16 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: "1.26"
           cache: true
+          # No go.sum yet (no external deps); hash go.mod so caching works and
+          # setup-go does not warn about a missing go.sum.
+          cache-dependency-path: go.mod
 
       - name: Validate (fmt, lint, vet, test, build)
         run: make check
