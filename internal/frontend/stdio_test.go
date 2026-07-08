@@ -10,9 +10,21 @@ import (
 	"time"
 
 	"github.com/intelligexhq/garmx/internal/aggregator"
+	"github.com/intelligexhq/garmx/internal/upstream"
 	"github.com/intelligexhq/garmx/internal/upstream/upstreamtest"
 	"github.com/intelligexhq/garmx/pkg/mcp"
 )
+
+// newProbeAgg builds an aggregator over a single "probe" upstream backed by the
+// fake, so exposed tools are prefixed as probe___<name>.
+func newProbeAgg(t *testing.T, fake *upstreamtest.Fake) *aggregator.Aggregator {
+	t.Helper()
+	mgr := upstream.NewManager(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := mgr.Add("probe", fake); err != nil {
+		t.Fatal(err)
+	}
+	return aggregator.New(mgr, aggregator.Profile{}, "test", slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
 
 // probeFake is a fake upstream that completes a handshake and answers a single
 // tool plus a pass-through tools/call.
@@ -61,7 +73,7 @@ func readEnv(t *testing.T, r *bufio.Reader) *mcp.Envelope {
 // prefixed tool surface and a pass-through call result.
 func TestStdioRoundTrip(t *testing.T) {
 	fake := probeFake()
-	agg := aggregator.New("probe", "test", fake, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	agg := newProbeAgg(t, fake)
 
 	inR, inW := io.Pipe()
 	outR, outW := io.Pipe()
@@ -126,7 +138,7 @@ func TestStdioRoundTrip(t *testing.T) {
 // the client out-of-band (not in response to a request).
 func TestStdioForwardsNotification(t *testing.T) {
 	fake := probeFake()
-	agg := aggregator.New("probe", "test", fake, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	agg := newProbeAgg(t, fake)
 
 	inR, inW := io.Pipe()
 	outR, outW := io.Pipe()

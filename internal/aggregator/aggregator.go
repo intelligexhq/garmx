@@ -3,67 +3,90 @@ package aggregator
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 
 	"github.com/intelligexhq/garmx/internal/upstream"
 	"github.com/intelligexhq/garmx/pkg/mcp"
 )
 
-// Aggregator is the protocol core for one client session. In this phase it
-// fronts exactly one upstream; the dispatch seam (prefix on the way out, split
-// on the way in, per-upstream routing) is the same one multi-server aggregation
-// will extend. It synthesizes initialize and every *_/list response and passes
-// through calls/reads with name rewriting.
+// Aggregator is the protocol core for one client session. It fans out across
+// every upstream in the manager, merges their capabilities and catalogs,
+// prefixes exposed names with the owning server, and routes calls back by
+// splitting the prefix. A Profile scopes what this session sees.
+//
+// Lists are served by live fan-out (no persistent cache): a client re-fetching
+// after a list_changed always gets a fresh merged view, which keeps correctness
+// simple; a per-profile cache is a later optimization, not a correctness need.
 type Aggregator struct {
-	serverName string // the upstream's registered name; the exposed-name prefix
-	version    string // GarmX version, reported as serverInfo
-	up         upstream.Transport
-	logger     *slog.Logger
+	mgr     *upstream.Manager
+	profile Profile
+	version string
+	logger  *slog.Logger
 
-	session Session
+	session  Session
+	initOnce sync.Once
+	caps     mcp.ServerCapabilities
 
-	// upstream initialize is performed lazily, once, on the first client
-	// initialize; upInit guards it and upCaps/upInfo cache the result.
-	upInit sync.Once
-	upErr  error
-	upCaps mcp.ServerCapabilities
-	upInfo mcp.Implementation
+	// uriOwners maps a resource uri to its owning server, populated on
+	// resources/list so resources/read (addressed by uri, not a prefixed name)
+	// can route. Guarded by uriMu.
+	uriMu     sync.Mutex
+	uriOwners map[string]string
 
+	notif        *notifier
 	notifyMu     sync.Mutex
 	clientNotify func(*mcp.Notification)
 }
 
-// New constructs an Aggregator fronting a single upstream registered as
-// serverName. It registers the upstream notification handler immediately, so it
-// must be called before the transport is started. logger must be non-nil.
-func New(serverName, version string, up upstream.Transport, logger *slog.Logger) *Aggregator {
+// New constructs an Aggregator over the manager's upstreams, scoped by profile.
+// It registers the manager's notification handler immediately, so it must be
+// called before the upstreams are started. logger must be non-nil.
+func New(mgr *upstream.Manager, profile Profile, version string, logger *slog.Logger) *Aggregator {
 	a := &Aggregator{
-		serverName: serverName,
-		version:    version,
-		up:         up,
-		logger:     logger.With("component", "aggregator"),
+		mgr:       mgr,
+		profile:   profile,
+		version:   version,
+		logger:    logger.With("component", "aggregator"),
+		uriOwners: map[string]string{},
 	}
-	up.SetHandlers(upstream.Handlers{OnNotification: a.onUpstreamNotification})
+	a.notif = newNotifier(notifyDebounce, a.emitToClient)
+	mgr.SetNotificationHandler(a.onUpstreamNotification)
 	return a
 }
 
 // SetClientNotifier registers the callback used to push server→client
-// notifications (e.g. a forwarded list_changed) to this session's client. The
-// frontend sets it once it can write to the client.
+// notifications (a forwarded list_changed) to this session's client.
 func (a *Aggregator) SetClientNotifier(fn func(*mcp.Notification)) {
 	a.notifyMu.Lock()
 	a.clientNotify = fn
 	a.notifyMu.Unlock()
 }
 
-// onUpstreamNotification forwards an upstream notification to the client. In
-// this phase it is a straight passthrough; the rebuild-merged-view-then-emit
-// and debounce logic (notify.go) arrives with multi-server aggregation. A
-// tools/list_changed still reaches the client, which — per the captures — will
-// re-fetch tools/list.
-func (a *Aggregator) onUpstreamNotification(n *mcp.Notification) {
+// onUpstreamNotification handles an upstream notification tagged with its
+// server. A list_changed from an out-of-scope server is dropped; otherwise
+// list_changed is coalesced and re-emitted to the client (which then re-fetches
+// the affected list). Non-list notifications are forwarded as-is.
+func (a *Aggregator) onUpstreamNotification(server string, n *mcp.Notification) {
+	if !a.profile.AllowsServer(server) {
+		return
+	}
+	if isListChanged(n.Method) {
+		a.notif.schedule(n.Method)
+		return
+	}
+	a.emitRaw(n)
+}
+
+// emitToClient sends a parameter-less notification (a coalesced list_changed) to
+// the client.
+func (a *Aggregator) emitToClient(method string) {
+	a.emitRaw(mcp.NewNotification(method, nil))
+}
+
+// emitRaw pushes a notification to the client if a notifier is registered.
+func (a *Aggregator) emitRaw(n *mcp.Notification) {
 	a.notifyMu.Lock()
 	fn := a.clientNotify
 	a.notifyMu.Unlock()
@@ -72,11 +95,9 @@ func (a *Aggregator) onUpstreamNotification(n *mcp.Notification) {
 	}
 }
 
-// HandleNotification processes a client→gateway notification. The client's
-// notifications/initialized only marks the session ready: GarmX already
-// completed its own upstream handshake during initialize, so it is not
-// re-forwarded. Everything else (e.g. OpenCode's post-call
-// notifications/cancelled for an already-finished call) is logged and dropped.
+// HandleNotification processes a client→gateway notification. initialized marks
+// the session ready (GarmX already handshook its upstreams during initialize);
+// everything else (e.g. OpenCode's post-call cancelled) is dropped.
 func (a *Aggregator) HandleNotification(_ context.Context, env *mcp.Envelope) {
 	switch env.Method {
 	case mcp.MethodInitialized:
@@ -86,9 +107,7 @@ func (a *Aggregator) HandleNotification(_ context.Context, env *mcp.Envelope) {
 	}
 }
 
-// Handle dispatches one client request and returns the response to send back.
-// It never returns nil: every request gets a response (a JSON-RPC error at
-// worst), so the frontend can write unconditionally.
+// Handle dispatches one client request and always returns a response.
 func (a *Aggregator) Handle(ctx context.Context, env *mcp.Envelope) *mcp.Response {
 	switch env.Method {
 	case mcp.MethodInitialize:
@@ -96,148 +115,154 @@ func (a *Aggregator) Handle(ctx context.Context, env *mcp.Envelope) *mcp.Respons
 	case mcp.MethodPing:
 		return mcp.NewResponse(env.ID, json.RawMessage(`{}`))
 	case mcp.MethodToolsList:
-		return a.handleList(ctx, env, mcp.MethodToolsList, "tools", true)
+		return a.handlePrefixedList(ctx, env, mcp.MethodToolsList, "tools", true)
 	case mcp.MethodPromptsList:
-		return a.handleList(ctx, env, mcp.MethodPromptsList, "prompts", true)
+		return a.handlePrefixedList(ctx, env, mcp.MethodPromptsList, "prompts", false)
 	case mcp.MethodResourcesList:
-		return a.handleList(ctx, env, mcp.MethodResourcesList, "resources", false)
+		return a.handleResourcesList(ctx, env, mcp.MethodResourcesList, "resources", true)
 	case mcp.MethodResourcesTemplateList:
-		return a.handleList(ctx, env, mcp.MethodResourcesTemplateList, "resourceTemplates", false)
+		return a.handleResourcesList(ctx, env, mcp.MethodResourcesTemplateList, "resourceTemplates", false)
 	case mcp.MethodToolsCall:
-		return a.handleNamedCall(ctx, env, mcp.MethodToolsCall)
+		return a.handleNamedCall(ctx, env, mcp.MethodToolsCall, true)
 	case mcp.MethodPromptsGet:
-		return a.handleNamedCall(ctx, env, mcp.MethodPromptsGet)
+		return a.handleNamedCall(ctx, env, mcp.MethodPromptsGet, false)
 	case mcp.MethodResourcesRead:
-		return a.passthrough(ctx, env, mcp.MethodResourcesRead)
+		return a.handleResourcesRead(ctx, env)
 	default:
 		return mcp.NewErrorResponse(env.ID, mcp.CodeMethodNotFound, "method not found: "+env.Method)
 	}
 }
 
-// handleInitialize completes GarmX's upstream handshake (once), records the
-// session, and returns the negotiated version plus the merged capabilities.
+// handleInitialize handshakes every in-scope upstream (once), records the
+// session, and returns the negotiated version plus the union of upstream
+// capabilities.
 func (a *Aggregator) handleInitialize(ctx context.Context, env *mcp.Envelope) *mcp.Response {
 	var params mcp.InitializeParams
 	if err := json.Unmarshal(env.Params, &params); err != nil {
 		return mcp.NewErrorResponse(env.ID, mcp.CodeInvalidParams, "invalid initialize params")
 	}
-
-	if err := a.ensureUpstream(ctx); err != nil {
-		a.logger.Error("upstream initialize failed", "err", err)
-		return mcp.NewErrorResponse(env.ID, mcp.CodeInternalError, "upstream initialize failed")
-	}
+	a.ensureUpstreams(ctx)
 
 	a.session = Session{
 		ProtocolVersion:    NegotiateClientVersion(params.ProtocolVersion),
 		ClientInfo:         params.ClientInfo,
 		ClientCapabilities: params.Capabilities,
 	}
-
 	result := mcp.InitializeResult{
 		ProtocolVersion: a.session.ProtocolVersion,
-		Capabilities:    MergeServerCapabilities(a.upCaps),
+		Capabilities:    a.caps,
 		ServerInfo:      mcp.Implementation{Name: "garmx", Title: "GarmX", Version: a.version},
 		Instructions:    "GarmX aggregating MCP gateway.",
 	}
 	return marshalResult(env.ID, result)
 }
 
-// ensureUpstream performs GarmX's client-side handshake with the upstream
-// exactly once: initialize, record capabilities/version, then send
-// notifications/initialized. Subsequent client sessions reuse the cached result.
-func (a *Aggregator) ensureUpstream(ctx context.Context) error {
-	a.upInit.Do(func() {
+// ensureUpstreams performs GarmX's client-side handshake with each in-scope
+// upstream exactly once, unioning their capabilities. A single upstream failing
+// to initialize is logged and skipped (its catalog simply won't appear), so one
+// broken server never blocks the whole aggregate.
+func (a *Aggregator) ensureUpstreams(ctx context.Context) {
+	a.initOnce.Do(func() {
 		reqParams := mcp.InitializeParams{
 			ProtocolVersion: mcp.PreferredProtocolVersion,
 			Capabilities:    json.RawMessage(`{}`),
 			ClientInfo:      mcp.Implementation{Name: "garmx", Version: a.version},
 		}
 		raw, _ := json.Marshal(reqParams)
-		result, rpcErr, err := a.up.Send(ctx, mcp.MethodInitialize, raw)
-		if err != nil {
-			a.upErr = err
-			return
-		}
-		if rpcErr != nil {
-			a.upErr = rpcErr
-			return
-		}
-		var res mcp.InitializeResult
-		if err := json.Unmarshal(result, &res); err != nil {
-			a.upErr = fmt.Errorf("decode upstream initialize result: %w", err)
-			return
-		}
-		a.upCaps = res.Capabilities
-		a.upInfo = res.ServerInfo
-		accepted, mismatch := NegotiateUpstreamVersion(res.ProtocolVersion)
-		if mismatch {
-			a.logger.Warn("upstream reported unrecognized protocol version", "version", accepted)
-		}
-		a.logger.Info("upstream initialized",
-			"server", a.upInfo.Name, "serverVersion", a.upInfo.Version, "protocol", accepted)
-		if err := a.up.Notify(ctx, mcp.MethodInitialized, nil); err != nil {
-			a.logger.Warn("failed to send notifications/initialized to upstream", "err", err)
+		for _, server := range a.servers() {
+			t, ok := a.mgr.Get(server)
+			if !ok {
+				continue
+			}
+			result, rpcErr, err := t.Send(ctx, mcp.MethodInitialize, raw)
+			if err != nil || rpcErr != nil {
+				a.logger.Warn("upstream initialize failed", "server", server, "err", err, "rpcErr", rpcErr)
+				continue
+			}
+			var res mcp.InitializeResult
+			if err := json.Unmarshal(result, &res); err != nil {
+				a.logger.Warn("malformed upstream initialize result", "server", server, "err", err)
+				continue
+			}
+			a.caps = MergeServerCapabilities(a.caps, res.Capabilities)
+			if accepted, mismatch := NegotiateUpstreamVersion(res.ProtocolVersion); mismatch {
+				a.logger.Warn("upstream reported unrecognized protocol version", "server", server, "version", accepted)
+			}
+			if err := t.Notify(ctx, mcp.MethodInitialized, nil); err != nil {
+				a.logger.Warn("failed notifications/initialized to upstream", "server", server, "err", err)
+			}
 		}
 	})
-	return a.upErr
 }
 
-// handleList synthesizes a *_/list response by eagerly draining every upstream
-// page (following nextCursor to exhaustion) and, for tools/prompts, rewriting
-// each item's name to its prefixed form. No client-facing cursor is emitted; a
-// client-supplied cursor is rejected, since GarmX issues none.
-func (a *Aggregator) handleList(ctx context.Context, env *mcp.Envelope, method, itemsKey string, prefixNames bool) *mcp.Response {
+// handlePrefixedList merges a name-addressed list (tools, prompts) across
+// upstreams: each item's name is rewritten to its exposed (prefixed) form, and
+// for tools the profile's allow/deny filter is applied. No client cursor is
+// emitted; a client-supplied cursor is rejected.
+func (a *Aggregator) handlePrefixedList(ctx context.Context, env *mcp.Envelope, method, itemsKey string, toolFilter bool) *mcp.Response {
 	if hasCursor(env.Params) {
 		return mcp.NewErrorResponse(env.ID, mcp.CodeInvalidParams, "cursor pagination is not supported; GarmX returns the full list")
 	}
-
 	var items []json.RawMessage
-	cursor := ""
-	for {
-		params := listParams(cursor)
-		result, rpcErr, err := a.up.Send(ctx, method, params)
+	for _, server := range a.servers() {
+		t, ok := a.mgr.Get(server)
+		if !ok {
+			continue
+		}
+		raw, err := a.drain(ctx, t, method, itemsKey)
 		if err != nil {
-			return mcp.NewErrorResponse(env.ID, mcp.CodeInternalError, "upstream "+method+" failed")
+			a.logger.Warn("skipping upstream in list", "server", server, "method", method, "err", err)
+			continue
 		}
-		if rpcErr != nil {
-			return &mcp.Response{JSONRPC: mcp.Version, ID: env.ID, Error: rpcErr}
+		for _, item := range raw {
+			exposed, rewritten, e := prefixItemName(server, item)
+			if e != nil {
+				a.logger.Warn("skipping item with unrewritable name", "server", server, "method", method, "err", e)
+				continue
+			}
+			if toolFilter && !a.profile.AllowsTool(exposed) {
+				continue
+			}
+			items = append(items, rewritten)
 		}
-		page, next, err := decodeList(result, itemsKey)
+	}
+	return listResponse(env.ID, itemsKey, items)
+}
+
+// handleResourcesList merges resource lists across upstreams without prefixing
+// (resources are addressed by already-namespaced uri). When recordOwners is set
+// it captures uri→server ownership so resources/read can route.
+func (a *Aggregator) handleResourcesList(ctx context.Context, env *mcp.Envelope, method, itemsKey string, recordOwners bool) *mcp.Response {
+	if hasCursor(env.Params) {
+		return mcp.NewErrorResponse(env.ID, mcp.CodeInvalidParams, "cursor pagination is not supported; GarmX returns the full list")
+	}
+	var items []json.RawMessage
+	for _, server := range a.servers() {
+		t, ok := a.mgr.Get(server)
+		if !ok {
+			continue
+		}
+		raw, err := a.drain(ctx, t, method, itemsKey)
 		if err != nil {
-			return mcp.NewErrorResponse(env.ID, mcp.CodeInternalError, "malformed upstream "+method+" result")
+			a.logger.Warn("skipping upstream in resources list", "server", server, "err", err)
+			continue
 		}
-		for _, item := range page {
-			if prefixNames {
-				rewritten, err := a.prefixItemName(item)
-				if err != nil {
-					a.logger.Warn("skipping item with unrewritable name", "method", method, "err", err)
-					continue
+		for _, item := range raw {
+			if recordOwners {
+				if uri := itemURI(item); uri != "" {
+					a.setURIOwner(uri, server)
 				}
-				item = rewritten
 			}
 			items = append(items, item)
 		}
-		if next == "" {
-			break
-		}
-		cursor = next
 	}
-
-	if items == nil {
-		items = []json.RawMessage{}
-	}
-	out, err := json.Marshal(map[string]any{itemsKey: items})
-	if err != nil {
-		return mcp.NewErrorResponse(env.ID, mcp.CodeInternalError, "encode list result")
-	}
-	return mcp.NewResponse(env.ID, out)
+	return listResponse(env.ID, itemsKey, items)
 }
 
-// handleNamedCall routes a name-addressed pass-through method (tools/call,
-// prompts/get): it splits the exposed name back to (server, original), rejects
-// a name that is not this server's, rewrites the name to the upstream's
-// original, and forwards. The result flows back to the client unchanged.
-func (a *Aggregator) handleNamedCall(ctx context.Context, env *mcp.Envelope, method string) *mcp.Response {
+// handleNamedCall routes tools/call and prompts/get: split the exposed name back
+// to (server, original), enforce the profile, rewrite to the original name, and
+// forward to the owning upstream.
+func (a *Aggregator) handleNamedCall(ctx context.Context, env *mcp.Envelope, method string, toolFilter bool) *mcp.Response {
 	fields := map[string]json.RawMessage{}
 	if err := json.Unmarshal(env.Params, &fields); err != nil {
 		return mcp.NewErrorResponse(env.ID, mcp.CodeInvalidParams, "invalid params for "+method)
@@ -247,8 +272,12 @@ func (a *Aggregator) handleNamedCall(ctx context.Context, env *mcp.Envelope, met
 		return mcp.NewErrorResponse(env.ID, mcp.CodeInvalidParams, "missing or invalid name for "+method)
 	}
 	server, original, ok := Split(exposed)
-	if !ok || server != a.serverName {
-		return mcp.NewErrorResponse(env.ID, mcp.CodeInvalidParams, "unknown name: "+exposed)
+	if !ok || !a.profile.AllowsServer(server) || (toolFilter && !a.profile.AllowsTool(exposed)) {
+		return mcp.NewErrorResponse(env.ID, mcp.CodeInvalidParams, "unknown or filtered name: "+exposed)
+	}
+	t, ok := a.mgr.Get(server)
+	if !ok {
+		return mcp.NewErrorResponse(env.ID, mcp.CodeInvalidParams, "unknown server: "+server)
 	}
 	orig, _ := json.Marshal(original)
 	fields["name"] = orig
@@ -256,99 +285,82 @@ func (a *Aggregator) handleNamedCall(ctx context.Context, env *mcp.Envelope, met
 	if err != nil {
 		return mcp.NewErrorResponse(env.ID, mcp.CodeInternalError, "re-encode params")
 	}
-	return a.forward(ctx, env.ID, method, params)
+	return forward(ctx, t, env.ID, method, params)
 }
 
-// passthrough forwards a method whose params need no rewriting (resources/read;
-// resources are addressed by already-namespaced uri, not a prefixed name).
-func (a *Aggregator) passthrough(ctx context.Context, env *mcp.Envelope, method string) *mcp.Response {
-	return a.forward(ctx, env.ID, method, env.Params)
-}
-
-// forward sends a request to the upstream and maps the outcome onto a client
-// response, echoing the client's id.
-func (a *Aggregator) forward(ctx context.Context, id json.RawMessage, method string, params json.RawMessage) *mcp.Response {
-	result, rpcErr, err := a.up.Send(ctx, method, params)
-	if err != nil {
-		return mcp.NewErrorResponse(id, mcp.CodeInternalError, "upstream "+method+" failed")
-	}
-	if rpcErr != nil {
-		return &mcp.Response{JSONRPC: mcp.Version, ID: id, Error: rpcErr}
-	}
-	return mcp.NewResponse(id, result)
-}
-
-// prefixItemName rewrites only the "name" field of a list item to its exposed
-// (prefixed) form, preserving every other field (description, schemas,
-// annotations) byte-for-byte.
-func (a *Aggregator) prefixItemName(item json.RawMessage) (json.RawMessage, error) {
-	fields := map[string]json.RawMessage{}
-	if err := json.Unmarshal(item, &fields); err != nil {
-		return nil, err
-	}
-	var name string
-	if err := json.Unmarshal(fields["name"], &name); err != nil {
-		return nil, fmt.Errorf("item has no string name: %w", err)
-	}
-	prefixed, err := json.Marshal(Prefix(a.serverName, name))
-	if err != nil {
-		return nil, err
-	}
-	fields["name"] = prefixed
-	return json.Marshal(fields)
-}
-
-// marshalResult encodes v as the result of a successful response for id.
-func marshalResult(id json.RawMessage, v any) *mcp.Response {
-	raw, err := json.Marshal(v)
-	if err != nil {
-		return mcp.NewErrorResponse(id, mcp.CodeInternalError, "encode result")
-	}
-	return mcp.NewResponse(id, raw)
-}
-
-// decodeList extracts the item array under itemsKey and the nextCursor from a
-// *_/list result, leaving items as raw messages so their unrelated fields are
-// untouched.
-func decodeList(result json.RawMessage, itemsKey string) (items []json.RawMessage, nextCursor string, err error) {
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal(result, &obj); err != nil {
-		return nil, "", err
-	}
-	if raw, ok := obj[itemsKey]; ok {
-		if err := json.Unmarshal(raw, &items); err != nil {
-			return nil, "", err
-		}
-	}
-	if raw, ok := obj["nextCursor"]; ok {
-		if err := json.Unmarshal(raw, &nextCursor); err != nil {
-			return nil, "", err
-		}
-	}
-	return items, nextCursor, nil
-}
-
-// listParams builds the params for an upstream *_/list call, including a cursor
-// only when continuing a drain.
-func listParams(cursor string) json.RawMessage {
-	if cursor == "" {
-		return nil
-	}
-	raw, _ := json.Marshal(map[string]string{"cursor": cursor})
-	return raw
-}
-
-// hasCursor reports whether client params carry a non-empty cursor, which GarmX
-// rejects because it issues no cursors.
-func hasCursor(params json.RawMessage) bool {
-	if len(params) == 0 {
-		return false
-	}
+// handleResourcesRead routes by uri ownership recorded during resources/list.
+// An unknown uri (never listed) is rejected rather than blindly fanned out.
+func (a *Aggregator) handleResourcesRead(ctx context.Context, env *mcp.Envelope) *mcp.Response {
 	var p struct {
-		Cursor string `json:"cursor"`
+		URI string `json:"uri"`
 	}
-	if err := json.Unmarshal(params, &p); err != nil {
-		return false
+	if err := json.Unmarshal(env.Params, &p); err != nil || p.URI == "" {
+		return mcp.NewErrorResponse(env.ID, mcp.CodeInvalidParams, "missing uri for resources/read")
 	}
-	return p.Cursor != ""
+	server, ok := a.uriOwner(p.URI)
+	if !ok {
+		return mcp.NewErrorResponse(env.ID, mcp.CodeInvalidParams, "unknown resource uri (list resources first): "+p.URI)
+	}
+	t, ok := a.mgr.Get(server)
+	if !ok {
+		return mcp.NewErrorResponse(env.ID, mcp.CodeInternalError, "owning server gone: "+server)
+	}
+	return forward(ctx, t, env.ID, mcp.MethodResourcesRead, env.Params)
+}
+
+// servers returns the in-scope server names in deterministic order.
+func (a *Aggregator) servers() []string {
+	var out []string
+	for _, name := range a.mgr.Names() {
+		if a.profile.AllowsServer(name) {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// drain reads all pages of a *_/list from one upstream, following nextCursor to
+// exhaustion, and returns the raw items concatenated.
+func (a *Aggregator) drain(ctx context.Context, t upstream.Transport, method, itemsKey string) ([]json.RawMessage, error) {
+	var items []json.RawMessage
+	cursor := ""
+	for {
+		result, rpcErr, err := t.Send(ctx, method, listParams(cursor))
+		if err != nil {
+			return nil, err
+		}
+		if rpcErr != nil {
+			return nil, rpcErr
+		}
+		page, next, derr := decodeList(result, itemsKey)
+		if derr != nil {
+			return nil, derr
+		}
+		items = append(items, page...)
+		if next == "" {
+			return items, nil
+		}
+		cursor = next
+	}
+}
+
+// setURIOwner records that server owns uri.
+func (a *Aggregator) setURIOwner(uri, server string) {
+	a.uriMu.Lock()
+	a.uriOwners[uri] = server
+	a.uriMu.Unlock()
+}
+
+// uriOwner returns the server that owns uri, if known.
+func (a *Aggregator) uriOwner(uri string) (string, bool) {
+	a.uriMu.Lock()
+	defer a.uriMu.Unlock()
+	server, ok := a.uriOwners[uri]
+	return server, ok
+}
+
+// isListChanged reports whether method is one of the catalog list-changed
+// notifications GarmX coalesces and forwards.
+func isListChanged(method string) bool {
+	return strings.HasPrefix(method, "notifications/") && strings.HasSuffix(method, "/list_changed")
 }

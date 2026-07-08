@@ -140,11 +140,21 @@ response demultiplexer.
 
 ---
 
-## Phase 2: Aggregation — many upstreams, prefixing, profiles
+## Phase 2: Aggregation — many upstreams, prefixing, profiles — done
 
-**Goal:** Register N upstreams; the daemon presents the merged capability set
-with `server___tool` prefixing, routes calls back correctly, and scopes the
-merged view per session profile.
+**Goal:** Register N upstreams; GarmX presents the merged capability set with
+`server___tool` prefixing, routes calls back correctly, and scopes the merged
+view per session profile. **Done** — see the acceptance note below.
+
+> **Design choices.** (1) **Live fan-out, no cache.** Lists are merged fresh on
+> each request (each upstream drained to exhaustion) rather than cached; a client
+> re-fetching after `list_changed` always gets a fresh view, so no cache
+> invalidation is needed. A per-profile cache is a later optimization, not a
+> correctness need. (2) **Routing needs no route map.** Since the prefix *is* the
+> server name, `Split` yields the owning server directly; only resources (uri, not
+> prefixed) keep a `uri→server` ownership map, populated on `resources/list`.
+> (3) **Auto-restart deferred.** The Manager does start/stop/lookup/notification
+> routing; crash-restart with backoff is deferred to the error-handling phase.
 
 ### Order of implementation
 
@@ -191,16 +201,87 @@ merged view per session profile.
 - Integration: simulate `list_changed` from one upstream → affected merged
   views update and clients are notified per profile.
 
-### Deliverables
+### Delivered
 
-- True multi-server aggregation with collision-safe naming.
-- Per-profile merged views and `list_changed` propagation.
-- **Acceptance:** Claude Code sees tools from two real MCP servers at once,
-  scoped by the profile it launched with.
+- `internal/upstream/manager.go`: named-transport set, StartAll/StopAll,
+  Get/Names, per-upstream notification tagging.
+- `internal/aggregator`: multi-upstream live fan-out merge (tools/prompts
+  prefixed, resources by uri ownership), union capabilities, `Split`-based tool
+  routing, `profile.go` (server subset + tool allow/deny globs, deny wins),
+  `notify.go` (debounced, profile-scoped forwarding of upstream `list_changed`).
+- `internal/config`: JSON config (servers + profiles) with validation;
+  `serve --config` / `--profile` wiring, single-upstream flags retained.
+- Tests: profile filtering, notifier coalescing, manager lifecycle/tagging,
+  config validation, and a two-upstream aggregator suite (union caps, merged
+  prefixed list, same-named tool routed to the right server, profile scoping,
+  scoped notifications). `make check` green.
+- **Acceptance passed:** real **Claude Code**, one `garmx` fronting **two**
+  stdio upstreams, called `mcp__garmx__alpha___echo` and
+  `mcp__garmx__beta___echo`; each routed to the correct upstream (name stripped,
+  `_meta` preserved). Profile scoping verified (`--profile solo` → alpha only;
+  a `*___echo` deny → empty list).
 
 ---
 
-## Phase 3: Persistence — registry, catalog, audit
+## Phase 3 (REVISED — proposed): Observability slice — SQLite audit + minimal UI
+
+> **Proposed reordering.** The original plan deferred all UI to Phase 5. This
+> revision pulls a **thin vertical slice** forward so GarmX's differentiator —
+> *see every MCP transaction in one place* — becomes visible right after
+> aggregation, at minimal cost. The fuller registry-as-source-of-truth +
+> import/export work (previously Phase 3) shifts to **Phase 4** (below).
+
+**Goal:** every client transaction is written to SQLite (redacted, size-capped),
+and a **read-only** UI on `:9735` shows recent calls + basic stats. No
+registry-in-SQLite, no live WebSocket, no auth — the smallest thing that makes
+the audit plane real and visible.
+
+### Scope (deliberately minimal)
+
+1. **`internal/audit`** — `redact.go` (strip secret-ish fields on the write
+   path), `store.go` (`modernc.org/sqlite`, WAL, single writer conn), `audit.go`
+   (async batched writer; size-cap payloads with a truncation marker; record
+   `payload_bytes`/`truncated`). The aggregator emits one row per client
+   request/response (server, method, exposed+original tool, latency, error).
+2. **`internal/api` + `internal/ui`** — one read-only page: stat tiles (calls,
+   error rate, p50/p95) and a recent-calls table, served from `audit_logs` with
+   indexed queries. Plain HTML + a small poll (no WebSocket yet); Templ optional.
+3. **Coordination — DECIDED: shared SQLite file, no daemon.** Each `serve
+   --stdio` opens the shared audit SQLite (WAL + a busy-timeout) and appends its
+   rows; a separate `garmx ui` command opens the same DB **read-only** and serves
+   the page on `:9735`. This keeps "SQLite is the source of truth" and defers the
+   daemon (discovery #4b) until a live stream or shared upstreams actually
+   justify it. Consequences to honor:
+   - Concurrent writers: multiple stdio processes write the same DB, so use WAL,
+     a `busy_timeout`, short transactions, and the batched writer's retry path.
+     (This is a real deviation from the "single dedicated writer" note, which
+     assumed one daemon; revisit that guidance when the daemon lands.)
+   - No live push: the UI **polls** the DB (e.g. every ~2s); the WebSocket live
+     stream waits for the daemon (option B, a later phase).
+   - `session_id` should be unique per stdio process (generate at startup) so
+     the UI can group by client.
+
+### Tests
+
+- Redaction: secrets in args/env never reach the stored payload.
+- Audit: batch insert, size-cap truncation, paginated/filtered query (`:memory:`).
+- API: stat + recent-calls handlers render from a seeded DB.
+
+### Deliverable
+
+- Run two upstreams through `garmx`, make some calls, open `:9735`, and see the
+  calls and per-server stats. The observability differentiator is visible.
+
+---
+
+## Phase 4: Persistence — registry, catalog (was Phase 3)
+
+> **Note (pending approval of the Phase 3 revision).** The **audit** items below
+> (redaction, audit writer — steps 5–6) move into the new Phase 3. This phase
+> then focuses on making **SQLite the source of truth for the catalog**:
+> registry CRUD, `garmx import`/`export`, schema cache, health. The Streamable
+> HTTP, full UI, and export phases that follow keep their content; only their
+> numbers shift once the reorder is confirmed.
 
 **Goal:** SQLite becomes the source of truth for the catalog; schemas are
 cached; every transaction is audited (redacted, size-capped) with retention.

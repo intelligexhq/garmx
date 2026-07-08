@@ -28,31 +28,25 @@ Tasks to progress GarmX. Design docs now live in `docs/`
 
 ## Start here next session
 
-**Phase 2 — aggregation: many upstreams, prefixing, profiles** (see
-`docs/implementation.md` Phase 2). The Phase 1 core is done and the seam is
-transport-agnostic. Next: an `upstream.Manager` holding N upstreams (lifecycle,
-restart/backoff), fan-out+merge in the aggregator keyed by profile, the
-`exposedName → (server, original)` route map (replacing the single-server
-Split), `profile.go` (server subset + tool allow/deny), and `notify.go`
-(rebuild affected per-profile views + debounced client emit). Acceptance:
-Claude Code sees tools from **two** real MCP servers at once, scoped by profile.
+**Phase 3 (REVISED) — observability slice: SQLite audit + minimal UI.** Pull a
+thin vertical slice forward so GarmX's differentiator (see every MCP transaction
+in one place) becomes visible now. Scope: `internal/audit` (redact →
+`modernc.org/sqlite` WAL → async batched, size-capped writer; aggregator emits a
+row per transaction) + a **read-only** `:9735` page (stat tiles + recent-calls
+table, DB-polling, no WebSocket/auth yet). See `docs/implementation.md`
+"Phase 3 (REVISED)".
 
-Carry-over decisions already coded and ready to extend:
+**Coordination — DECIDED (A): shared SQLite file, no daemon.** Each `serve
+--stdio` opens the shared audit DB (WAL + busy-timeout) and appends rows; a
+separate `garmx ui` opens it read-only and serves `:9735`. UI polls (no
+WebSocket yet); unique `session_id` per stdio process. The daemon (option B,
+discovery #4b) waits for when a live stream or shared upstreams justify it.
 
-- `server___tool` split + `MergeServerCapabilities` (union) in
-  `internal/aggregator`; eager page-merge + client-cursor rejection live in
-  `handleList`. Multi-server just adds the route map + per-profile cache.
-- Both clients re-fetch `tools/list` on `list_changed` within ms → `notify.go`
-  fan-out lands; add debounce.
-- OpenCode's post-call `notifications/cancelled` is already dropped as a no-op
-  in the aggregator.
+After Phase 3: **Phase 4** = registry/catalog in SQLite + `garmx import`/`export`
+(the old Phase 3, minus audit which moved into Phase 3).
 
-**Also pending:** the daemon/shim split (discovery #4b) — deferred past Phase 1,
-which runs the aggregator in-process. Revisit when multi-client sharing or the
-UI daemon needs it.
-
-The probe + `opencode.json` provider template live in the scratchpad; full
-source is in the appendix of `docs/research/client-handshakes.md`.
+The probe + `opencode.json` provider template + a two-upstream `garmx.json` live
+in the scratchpad; probe source is in `docs/research/client-handshakes.md`.
 
 ## Next steps
 
@@ -80,8 +74,17 @@ source is in the appendix of `docs/research/client-handshakes.md`.
    Unit + subprocess-correlation + end-to-end tests; `make check` green.
    **Acceptance passed:** real Claude Code called `mcp__garmx__probe___echo`
    through GarmX. Daemon/shim split deferred (in-process for now; discovery #4b).
-5. [ ] **Phase 2** — multi-upstream aggregation, per-profile merged views,
-   `notify.go` propagation. (Now the "start here" item above.)
+5. [x] **Phase 2 — multi-upstream aggregation, profiles, notify.** `upstream.Manager`;
+   aggregator live fan-out merge + prefix + `Split` routing + `uri` ownership;
+   `profile.go` (subset + allow/deny globs); `notify.go` (debounced, scoped);
+   `internal/config` (servers + profiles) + `serve --config/--profile`. Tests +
+   `make check` green. **Acceptance passed:** Claude Code called tools from two
+   upstreams through one GarmX, each routed correctly; profiles verified.
+6. [ ] **Phase 3 (REVISED)** — SQLite audit + minimal read-only UI (the "start
+   here" item above). Blocked on the A/B coordination decision.
+7. [ ] **Phase 4** — registry/catalog as SQLite source of truth + import/export.
+8. [ ] **Daemon/shim split** (discovery #4b) — when the live stream or
+   upstream-sharing justifies it (folds into Phase 3 option B, or later).
 
 ## Later
 
