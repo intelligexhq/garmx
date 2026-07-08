@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="{{.RefreshSeconds}}">
+<title>GarmX — audit</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+         background: #0e1116; color: #e6edf3; }
+  header { padding: 16px 24px; border-bottom: 1px solid #222b36; display: flex;
+           align-items: baseline; gap: 12px; }
+  header h1 { font-size: 16px; margin: 0; letter-spacing: 0.5px; }
+  header .sub { color: #8b98a5; font-size: 12px; }
+  main { padding: 24px; max-width: 1100px; margin: 0 auto; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+           gap: 12px; margin-bottom: 28px; }
+  .tile { background: #161b22; border: 1px solid #222b36; border-radius: 8px; padding: 16px; }
+  .tile .label { color: #8b98a5; font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px; }
+  .tile .value { font-size: 26px; margin-top: 6px; }
+  h2 { font-size: 13px; color: #8b98a5; text-transform: uppercase; letter-spacing: 0.6px;
+       margin: 24px 0 8px; }
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid #1c242e; white-space: nowrap; }
+  th { color: #8b98a5; font-weight: 600; }
+  tr:hover td { background: #131820; }
+  a { color: #58a6ff; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .ok { color: #3fb950; }
+  .err { color: #f85149; }
+  .muted { color: #6e7b8a; }
+  .empty { color: #6e7b8a; padding: 24px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>GarmX</h1>
+  <span class="sub">MCP audit — read-only · refreshes every {{.RefreshSeconds}}s</span>
+</header>
+<main>
+  <div class="tiles">
+    <div class="tile"><div class="label">Total calls</div><div class="value">{{.Stats.TotalCalls}}</div></div>
+    <div class="tile"><div class="label">Errors</div><div class="value">{{.Stats.Errors}}</div></div>
+    <div class="tile"><div class="label">Error rate</div><div class="value">{{printf "%.1f%%" .ErrorPct}}</div></div>
+    <div class="tile"><div class="label">Latency p50</div><div class="value">{{.Stats.P50ms}}<span class="muted"> ms</span></div></div>
+    <div class="tile"><div class="label">Latency p95</div><div class="value">{{.Stats.P95ms}}<span class="muted"> ms</span></div></div>
+  </div>
+
+  <h2>Per server</h2>
+  <div class="scroll">
+  {{if .Stats.PerServer}}
+  <table>
+    <thead><tr><th>Server</th><th>Calls</th><th>Errors</th><th>Avg ms</th></tr></thead>
+    <tbody>
+    {{range .Stats.PerServer}}
+      <tr>
+        <td>{{if .Server}}{{.Server}}{{else}}<span class="muted">(none)</span>{{end}}</td>
+        <td>{{.Calls}}</td>
+        <td>{{if .Errors}}<span class="err">{{.Errors}}</span>{{else}}0{{end}}</td>
+        <td>{{.AvgMS}}</td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{else}}<div class="empty">No transactions recorded yet.</div>{{end}}
+  </div>
+
+  <h2>Recent calls</h2>
+  <div class="scroll">
+  {{if .Recent}}
+  <table>
+    <thead><tr><th>Time (UTC)</th><th>Client</th><th>Server</th><th>Tool</th><th>Method</th><th>ms</th><th>Status</th></tr></thead>
+    <tbody>
+    {{range .Recent}}
+      <tr>
+        <td class="muted"><a href="/logs/{{.ID}}">{{.CreatedAt}}</a></td>
+        <td>{{if .ClientName}}{{.ClientName}}{{else}}<span class="muted">—</span>{{end}}</td>
+        <td>{{if .ServerName}}{{.ServerName}}{{else}}<span class="muted">—</span>{{end}}</td>
+        <td>{{if .ToolExposed}}{{.ToolExposed}}{{else}}<span class="muted">—</span>{{end}}</td>
+        <td class="muted">{{.Method}}</td>
+        <td>{{.LatencyMS}}</td>
+        <td>{{if .ErrorCode}}<span class="err">error {{.ErrorCode}}</span>{{else}}<span class="ok">ok</span>{{end}}</td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{else}}<div class="empty">No transactions recorded yet.</div>{{end}}
+  </div>
+</main>
+</body>
+</html>

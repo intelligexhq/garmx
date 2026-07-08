@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GarmX — transaction #{{.Entry.ID}}</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+         background: #0e1116; color: #e6edf3; }
+  a { color: #58a6ff; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  header { padding: 16px 24px; border-bottom: 1px solid #222b36; }
+  header h1 { font-size: 16px; margin: 8px 0 0; }
+  main { padding: 24px; max-width: 1000px; margin: 0 auto; }
+  h2 { font-size: 13px; color: #8b98a5; text-transform: uppercase; letter-spacing: 0.6px;
+       margin: 24px 0 8px; }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: 6px 18px; margin: 0; }
+  dt { color: #8b98a5; }
+  dd { margin: 0; word-break: break-word; }
+  pre { background: #161b22; border: 1px solid #222b36; border-radius: 8px; padding: 14px;
+        overflow-x: auto; white-space: pre; margin: 0; }
+  .ok { color: #3fb950; }
+  .err { color: #f85149; }
+  .muted { color: #6e7b8a; }
+  .badge { display: inline-block; background: #3a2a12; color: #e3b341; border-radius: 4px;
+           padding: 1px 6px; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <a href="/">&larr; back to dashboard</a>
+  <h1>{{.Entry.Method}} <span class="muted">#{{.Entry.ID}}</span></h1>
+</header>
+<main>
+  <h2>Details</h2>
+  <dl>
+    <dt>Time (UTC)</dt><dd>{{.Entry.CreatedAt}}</dd>
+    <dt>Status</dt>
+    <dd>{{if .Entry.ErrorCode}}<span class="err">error {{.Entry.ErrorCode}}{{if .Entry.ErrorMessage}} — {{.Entry.ErrorMessage}}{{end}}</span>{{else}}<span class="ok">ok</span>{{end}}</dd>
+    <dt>Latency</dt><dd>{{.Entry.LatencyMS}} ms</dd>
+    <dt>Server</dt><dd>{{if .Entry.ServerName}}{{.Entry.ServerName}}{{else}}<span class="muted">—</span>{{end}}</dd>
+    <dt>Tool</dt>
+    <dd>{{if .Entry.ToolExposed}}{{.Entry.ToolExposed}} <span class="muted">→ {{.Entry.ToolOriginal}}</span>{{else}}<span class="muted">—</span>{{end}}</dd>
+    <dt>Client</dt>
+    <dd>{{if .Entry.ClientName}}{{.Entry.ClientName}} <span class="muted">{{.Entry.ClientVersion}}</span>{{else}}<span class="muted">—</span>{{end}}</dd>
+    <dt>Session</dt><dd class="muted">{{.Entry.SessionID}}</dd>
+    <dt>RPC id</dt><dd class="muted">{{if .Entry.RPCID}}{{.Entry.RPCID}}{{else}}—{{end}}</dd>
+    <dt>Payload bytes</dt>
+    <dd>{{.Entry.PayloadBytes}}{{if .Entry.Truncated}} <span class="badge">truncated</span>{{end}}</dd>
+  </dl>
+
+  <h2>Request</h2>
+  {{if .RequestPretty}}<pre>{{.RequestPretty}}</pre>{{else}}<p class="muted">— no request body captured</p>{{end}}
+
+  <h2>{{if .Entry.ErrorCode}}Response (error data){{else}}Response{{end}}</h2>
+  {{if .ResponsePretty}}<pre>{{.ResponsePretty}}</pre>{{else}}<p class="muted">— no response body captured</p>{{end}}
+</main>
+</body>
+</html>

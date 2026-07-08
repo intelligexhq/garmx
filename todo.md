@@ -28,22 +28,21 @@ Tasks to progress GarmX. Design docs now live in `docs/`
 
 ## Start here next session
 
-**Phase 3 (REVISED) — observability slice: SQLite audit + minimal UI.** Pull a
-thin vertical slice forward so GarmX's differentiator (see every MCP transaction
-in one place) becomes visible now. Scope: `internal/audit` (redact →
-`modernc.org/sqlite` WAL → async batched, size-capped writer; aggregator emits a
-row per transaction) + a **read-only** `:9735` page (stat tiles + recent-calls
-table, DB-polling, no WebSocket/auth yet). See `docs/implementation.md`
-"Phase 3 (REVISED)".
+**Phase 4 — registry/catalog as SQLite source of truth + import/export.**
+Make SQLite authoritative for the catalog: `internal/registry` (`store.go`
+WAL + read pool, `registry.go` CRUD that starts/restarts upstreams via the
+manager), `garmx import`/`export` (adopt Claude Code `.mcp.json` /
+OpenCode `opencode.json`; `--config` seeds once), `schema.go` capability cache,
+and `internal/health` liveness. See `docs/implementation.md` "Phase 4".
 
-**Coordination — DECIDED (A): shared SQLite file, no daemon.** Each `serve
---stdio` opens the shared audit DB (WAL + busy-timeout) and appends rows; a
-separate `garmx ui` opens it read-only and serves `:9735`. UI polls (no
-WebSocket yet); unique `session_id` per stdio process. The daemon (option B,
-discovery #4b) waits for when a live stream or shared upstreams justify it.
+**Reconcile the audit schema deviation while here:** `audit_logs.server_name`
+is free text with no FK because the `servers` table did not exist in Phase 3;
+add the `server_id` FK (and revisit `tool_exposed`/`tool_original`) now that the
+registry lands.
 
-After Phase 3: **Phase 4** = registry/catalog in SQLite + `garmx import`/`export`
-(the old Phase 3, minus audit which moved into Phase 3).
+**Coordination note:** Phase 3 shipped option A (shared SQLite file, no daemon;
+`garmx ui` reads it read-only). The daemon (option B, discovery #4b) still waits
+for a live stream or shared upstreams to justify it.
 
 The probe + `opencode.json` provider template + a two-upstream `garmx.json` live
 in the scratchpad; probe source is in `docs/research/client-handshakes.md`.
@@ -80,9 +79,15 @@ in the scratchpad; probe source is in `docs/research/client-handshakes.md`.
    `internal/config` (servers + profiles) + `serve --config/--profile`. Tests +
    `make check` green. **Acceptance passed:** Claude Code called tools from two
    upstreams through one GarmX, each routed correctly; profiles verified.
-6. [ ] **Phase 3 (REVISED)** — SQLite audit + minimal read-only UI (the "start
-   here" item above). Blocked on the A/B coordination decision.
-7. [ ] **Phase 4** — registry/catalog as SQLite source of truth + import/export.
+6. [x] **Phase 3 (REVISED)** — SQLite audit + minimal read-only UI. `internal/audit`
+   (redact → `modernc.org/sqlite` WAL writer, async batched, size-capped,
+   best-effort), aggregator `Event`/`Sink` seam, `audit` config block, and a
+   read-only `garmx ui` on `:9735` (stat tiles + recent-calls). Option A (shared
+   file, no daemon). `make check` green; scripted stdio acceptance passed
+   (redaction verified, unwritable-DB path degrades gracefully).
+7. [ ] **Phase 4** — registry/catalog as SQLite source of truth + import/export
+   (the "start here" item above). Reconcile the audit `server_name` no-FK
+   deviation here.
 8. [ ] **Daemon/shim split** (discovery #4b) — when the live stream or
    upstream-sharing justifies it (folds into Phase 3 option B, or later).
 

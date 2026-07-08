@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 )
 
 // Config is the on-disk declaration of upstream servers and profiles used to
@@ -11,8 +13,75 @@ import (
 // authoritative store arrives later); it is plain JSON for now (JSONC comment
 // stripping is a later concern).
 type Config struct {
-	Servers  []Server  `json:"servers"`
-	Profiles []Profile `json:"profiles,omitempty"`
+	Servers  []Server     `json:"servers"`
+	Profiles []Profile    `json:"profiles,omitempty"`
+	Audit    *AuditConfig `json:"audit,omitempty"`
+}
+
+// Audit payload capture modes: how much of each transaction is persisted.
+const (
+	// PayloadRequestResponse stores both the request arguments and the response
+	// body (each redacted and size-capped). Richest audit trail.
+	PayloadRequestResponse = "request-response"
+	// PayloadRequest stores only the request arguments; the response is reduced
+	// to its error code and latency.
+	PayloadRequest = "request"
+	// PayloadMetadata stores no payload bodies at all — only server, method,
+	// tool names, latency, and error.
+	PayloadMetadata = "metadata"
+)
+
+// Audit emission scopes: which transactions are recorded.
+const (
+	// ScopeCalls audits only the arg-bearing, routed transactions
+	// (tools/call, prompts/get, resources/read).
+	ScopeCalls = "calls"
+	// ScopeAll audits every client request, including synthesized
+	// initialize/*list responses.
+	ScopeAll = "all"
+)
+
+// Default audit settings applied when neither the config file nor a flag
+// specifies a value.
+const (
+	defaultMaxPayloadBytes = 16 * 1024
+)
+
+// AuditConfig is the on-disk `audit` block. Every field is optional: a nil
+// Enabled, an empty string, or a zero MaxPayloadBytes means "unset", and
+// ResolveAudit fills it from the built-in default (which a CLI flag/env can then
+// override). Pointer/empty-value semantics are what let "omitted" differ from an
+// explicit value.
+type AuditConfig struct {
+	Enabled         *bool    `json:"enabled,omitempty"`
+	DBPath          string   `json:"dbPath,omitempty"`
+	Payload         string   `json:"payload,omitempty"`
+	Scope           string   `json:"scope,omitempty"`
+	MaxPayloadBytes int      `json:"maxPayloadBytes,omitempty"`
+	RedactKeys      []string `json:"redactKeys,omitempty"`
+}
+
+// ResolvedAudit is the fully-defaulted audit configuration the rest of the
+// program consumes: no optionals, no "unset" states.
+type ResolvedAudit struct {
+	Enabled         bool
+	DBPath          string
+	Payload         string
+	Scope           string
+	MaxPayloadBytes int
+	// RedactKeys are extra secret-key names, additive to the redactor's built-in
+	// set.
+	RedactKeys []string
+}
+
+// AuditOverride carries per-invocation overrides sourced from CLI flags and env
+// vars. An empty string means "not overridden"; Disable forces auditing off
+// regardless of the file.
+type AuditOverride struct {
+	DBPath  string
+	Payload string
+	Scope   string
+	Disable bool
 }
 
 // Server declares one upstream MCP server. Only stdio is supported in this
@@ -85,7 +154,114 @@ func (c *Config) validate() error {
 		}
 		profiles[p.Name] = struct{}{}
 	}
+	if c.Audit != nil {
+		if err := validatePayload(c.Audit.Payload); err != nil {
+			return err
+		}
+		if err := validateScope(c.Audit.Scope); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// validatePayload accepts the empty string (unset) or a known payload mode.
+func validatePayload(p string) error {
+	switch p {
+	case "", PayloadRequestResponse, PayloadRequest, PayloadMetadata:
+		return nil
+	default:
+		return fmt.Errorf("audit.payload %q: want one of %q, %q, %q", p,
+			PayloadRequestResponse, PayloadRequest, PayloadMetadata)
+	}
+}
+
+// validateScope accepts the empty string (unset) or a known scope.
+func validateScope(s string) error {
+	switch s {
+	case "", ScopeCalls, ScopeAll:
+		return nil
+	default:
+		return fmt.Errorf("audit.scope %q: want %q or %q", s, ScopeCalls, ScopeAll)
+	}
+}
+
+// ResolveAudit layers the built-in defaults, the config file's audit block, and
+// per-invocation overrides (flags/env, which win) into one fully-defaulted
+// value. It validates the final payload/scope and expands a leading ~ in the DB
+// path so writer and reader resolve the same file.
+func ResolveAudit(file *AuditConfig, ov AuditOverride) (ResolvedAudit, error) {
+	r := ResolvedAudit{
+		Enabled:         true,
+		DBPath:          DefaultAuditDBPath(),
+		Payload:         PayloadRequestResponse,
+		Scope:           ScopeCalls,
+		MaxPayloadBytes: defaultMaxPayloadBytes,
+	}
+	if file != nil {
+		if file.Enabled != nil {
+			r.Enabled = *file.Enabled
+		}
+		if file.DBPath != "" {
+			r.DBPath = file.DBPath
+		}
+		if file.Payload != "" {
+			r.Payload = file.Payload
+		}
+		if file.Scope != "" {
+			r.Scope = file.Scope
+		}
+		if file.MaxPayloadBytes > 0 {
+			r.MaxPayloadBytes = file.MaxPayloadBytes
+		}
+		r.RedactKeys = file.RedactKeys
+	}
+	if ov.DBPath != "" {
+		r.DBPath = ov.DBPath
+	}
+	if ov.Payload != "" {
+		r.Payload = ov.Payload
+	}
+	if ov.Scope != "" {
+		r.Scope = ov.Scope
+	}
+	if ov.Disable {
+		r.Enabled = false
+	}
+	if err := validatePayload(r.Payload); err != nil {
+		return ResolvedAudit{}, err
+	}
+	if err := validateScope(r.Scope); err != nil {
+		return ResolvedAudit{}, err
+	}
+	r.DBPath = expandHome(r.DBPath)
+	return r, nil
+}
+
+// DefaultAuditDBPath is the built-in location of the shared audit database:
+// $XDG_DATA_HOME/garmx/audit.db, else ~/.local/share/garmx/audit.db. It falls
+// back to the OS temp dir only if the home directory cannot be determined, so a
+// path is always returned.
+func DefaultAuditDBPath() string {
+	if dir := os.Getenv("XDG_DATA_HOME"); dir != "" {
+		return filepath.Join(dir, "garmx", "audit.db")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return filepath.Join(os.TempDir(), "garmx", "audit.db")
+	}
+	return filepath.Join(home, ".local", "share", "garmx", "audit.db")
+}
+
+// expandHome replaces a leading ~ with the user's home directory; other paths
+// pass through unchanged.
+func expandHome(path string) string {
+	if path == "~" || strings.HasPrefix(path, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, strings.TrimPrefix(path, "~"))
+		}
+	}
+	return path
 }
 
 // EnvSlice converts a Server's env map to the "KEY=VALUE" slice exec expects.

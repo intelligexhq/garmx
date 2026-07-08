@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/intelligexhq/garmx/internal/upstream"
 	"github.com/intelligexhq/garmx/pkg/mcp"
@@ -38,6 +39,24 @@ type Aggregator struct {
 	notif        *notifier
 	notifyMu     sync.Mutex
 	clientNotify func(*mcp.Notification)
+
+	// sink receives one Event per audited transaction; nil disables auditing so
+	// the dispatch path stays unconditional. sessionID is this process's stable
+	// session identifier (option A: one stdio process == one session). auditAll
+	// additionally records the synthesized non-call methods (initialize, */list);
+	// when false only the routed calls are audited.
+	sink      Sink
+	sessionID string
+	auditAll  bool
+}
+
+// SetAudit installs the audit sink for this session. A nil sink leaves auditing
+// off. auditAll selects the "all" scope (also record initialize/*list); false
+// records only routed calls (tools/call, prompts/get, resources/read).
+func (a *Aggregator) SetAudit(sink Sink, sessionID string, auditAll bool) {
+	a.sink = sink
+	a.sessionID = sessionID
+	a.auditAll = auditAll
 }
 
 // New constructs an Aggregator over the manager's upstreams, scoped by profile.
@@ -107,8 +126,22 @@ func (a *Aggregator) HandleNotification(_ context.Context, env *mcp.Envelope) {
 	}
 }
 
-// Handle dispatches one client request and always returns a response.
+// Handle dispatches one client request and always returns a response. Routed
+// calls (tools/call, prompts/get, resources/read) audit themselves inside their
+// handlers, where the resolved server/tool is known; the synthesized methods are
+// audited here, and only under the "all" scope.
 func (a *Aggregator) Handle(ctx context.Context, env *mcp.Envelope) *mcp.Response {
+	if a.sink != nil && a.auditAll && !isCallMethod(env.Method) {
+		start := time.Now()
+		resp := a.dispatch(ctx, env)
+		a.recordGeneric(env, resp, start)
+		return resp
+	}
+	return a.dispatch(ctx, env)
+}
+
+// dispatch routes one client request to its handler.
+func (a *Aggregator) dispatch(ctx context.Context, env *mcp.Envelope) *mcp.Response {
 	switch env.Method {
 	case mcp.MethodInitialize:
 		return a.handleInitialize(ctx, env)
@@ -285,7 +318,13 @@ func (a *Aggregator) handleNamedCall(ctx context.Context, env *mcp.Envelope, met
 	if err != nil {
 		return mcp.NewErrorResponse(env.ID, mcp.CodeInternalError, "re-encode params")
 	}
-	return forward(ctx, t, env.ID, method, params)
+	if a.sink == nil {
+		return forward(ctx, t, env.ID, method, params)
+	}
+	start := time.Now()
+	resp := forward(ctx, t, env.ID, method, params)
+	a.recordCall(env, method, server, exposed, original, resp, start)
+	return resp
 }
 
 // handleResourcesRead routes by uri ownership recorded during resources/list.
@@ -305,7 +344,13 @@ func (a *Aggregator) handleResourcesRead(ctx context.Context, env *mcp.Envelope)
 	if !ok {
 		return mcp.NewErrorResponse(env.ID, mcp.CodeInternalError, "owning server gone: "+server)
 	}
-	return forward(ctx, t, env.ID, mcp.MethodResourcesRead, env.Params)
+	if a.sink == nil {
+		return forward(ctx, t, env.ID, mcp.MethodResourcesRead, env.Params)
+	}
+	start := time.Now()
+	resp := forward(ctx, t, env.ID, mcp.MethodResourcesRead, env.Params)
+	a.recordCall(env, mcp.MethodResourcesRead, server, "", "", resp, start)
+	return resp
 }
 
 // servers returns the in-scope server names in deterministic order.
@@ -357,6 +402,74 @@ func (a *Aggregator) uriOwner(uri string) (string, bool) {
 	defer a.uriMu.Unlock()
 	server, ok := a.uriOwners[uri]
 	return server, ok
+}
+
+// recordCall emits an audit Event for a routed call (tools/call, prompts/get,
+// resources/read), capturing the resolved server/tool, the client's original
+// params, the upstream result, latency, and any error code. Server/tool are the
+// caller's already-resolved values; RequestParams is the pre-rewrite params.
+func (a *Aggregator) recordCall(env *mcp.Envelope, method, server, exposed, original string, resp *mcp.Response, start time.Time) {
+	e := Event{
+		SessionID:     a.sessionID,
+		ClientName:    a.session.ClientInfo.Name,
+		ClientVersion: a.session.ClientInfo.Version,
+		Method:        method,
+		Server:        server,
+		ToolExposed:   exposed,
+		ToolOriginal:  original,
+		RPCID:         string(env.ID),
+		RequestParams: env.Params,
+		LatencyMS:     time.Since(start).Milliseconds(),
+	}
+	a.fillResponse(&e, resp)
+	a.sink.Record(e)
+}
+
+// recordGeneric emits an audit Event for a synthesized, non-routed method
+// (initialize, */list, ping) under the "all" scope: no server/tool is resolved,
+// so those fields stay empty.
+func (a *Aggregator) recordGeneric(env *mcp.Envelope, resp *mcp.Response, start time.Time) {
+	e := Event{
+		SessionID:     a.sessionID,
+		ClientName:    a.session.ClientInfo.Name,
+		ClientVersion: a.session.ClientInfo.Version,
+		Method:        env.Method,
+		RPCID:         string(env.ID),
+		RequestParams: env.Params,
+		LatencyMS:     time.Since(start).Milliseconds(),
+	}
+	a.fillResponse(&e, resp)
+	a.sink.Record(e)
+}
+
+// fillResponse copies the result body and any error onto the event. On an error
+// response there is no result, so the error's structured data (when present)
+// takes the response-body slot — it is the payload the upstream returned — and
+// the error code and message are captured for display.
+func (a *Aggregator) fillResponse(e *Event, resp *mcp.Response) {
+	if resp == nil {
+		return
+	}
+	e.ResponseResult = resp.Result
+	if resp.Error != nil {
+		code := resp.Error.Code
+		e.ErrorCode = &code
+		e.ErrorMessage = resp.Error.Message
+		if len(resp.Error.Data) > 0 {
+			e.ResponseResult = resp.Error.Data
+		}
+	}
+}
+
+// isCallMethod reports whether method is a routed call that audits itself inside
+// its handler (so the Handle wrapper must not double-record it).
+func isCallMethod(method string) bool {
+	switch method {
+	case mcp.MethodToolsCall, mcp.MethodPromptsGet, mcp.MethodResourcesRead:
+		return true
+	default:
+		return false
+	}
 }
 
 // isListChanged reports whether method is one of the catalog list-changed

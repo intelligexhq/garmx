@@ -223,13 +223,14 @@ view per session profile. **Done** — see the acceptance note below.
 
 ---
 
-## Phase 3 (REVISED — proposed): Observability slice — SQLite audit + minimal UI
+## Phase 3 (REVISED): Observability slice — SQLite audit + minimal UI — done
 
-> **Proposed reordering.** The original plan deferred all UI to Phase 5. This
-> revision pulls a **thin vertical slice** forward so GarmX's differentiator —
-> *see every MCP transaction in one place* — becomes visible right after
-> aggregation, at minimal cost. The fuller registry-as-source-of-truth +
-> import/export work (previously Phase 3) shifts to **Phase 4** (below).
+> **Reordering.** The original plan deferred all UI to Phase 5. This revision
+> pulled a **thin vertical slice** forward so GarmX's differentiator — *see every
+> MCP transaction in one place* — became visible right after aggregation, at
+> minimal cost. The fuller registry-as-source-of-truth + import/export work
+> (previously Phase 3) shifts to **Phase 4** (below). **Done** — see the delivered
+> note below.
 
 **Goal:** every client transaction is written to SQLite (redacted, size-capped),
 and a **read-only** UI on `:9735` shows recent calls + basic stats. No
@@ -271,6 +272,45 @@ the audit plane real and visible.
 
 - Run two upstreams through `garmx`, make some calls, open `:9735`, and see the
   calls and per-server stats. The observability differentiator is visible.
+
+### Delivered
+
+- `internal/audit`: `store.go` (`modernc.org/sqlite`, WAL + busy_timeout;
+  `OpenWriter` pins one connection per process, `OpenReader` is query-only;
+  `Recent` + `Stats` with nearest-rank p50/p95 via ORDER BY + OFFSET), `redact.go`
+  (recursive secret-key scrubbing on the write path, config-additive keys),
+  `audit.go` (non-blocking `Record`, single background goroutine batching on a
+  1s tick / 100 rows, per-payload size cap with a truncation marker, best-effort:
+  drops with a warning rather than blocking or crashing).
+- `internal/aggregator`: an `Event`/`Sink` seam owned by the producer (keeps the
+  aggregator SQLite-free); calls audit themselves in `handleNamedCall` /
+  `handleResourcesRead`, and the `all` scope additionally records synthesized
+  methods at the `Handle` wrapper.
+- `internal/config`: an `audit` block (`enabled`/`dbPath`/`payload`/`scope`/
+  `maxPayloadBytes`/`redactKeys`) with `ResolveAudit` layering
+  defaults ← file ← flags/env and enum validation.
+- `internal/api` + `internal/ui`: a read-only `net/http` server (`GET /`
+  dashboard, `GET /logs/{id}` per-transaction detail, `GET /api/logs`,
+  `GET /health`) rendering embedded `html/template` pages (stat tiles +
+  per-server + recent-calls with 2s meta-refresh; a static detail page with
+  pretty-printed request/response bodies and, for failures, the captured error
+  code + message).
+- `cmd/garmx`: audit wired into `serve` (unique per-process session id,
+  `--audit-db`/`--audit-payload`/`--audit-scope`/`--no-audit`, `GARMX_AUDIT_DB`);
+  a new `garmx ui` subcommand bound to `127.0.0.1:9735` by default.
+- Tests: redaction, audit store/writer (batch, size-cap, non-blocking drop,
+  stats), aggregator emit/scope, config resolve/precedence, and API handlers.
+  `make check` green.
+- **Acceptance:** a scripted stdio client drove `initialize` → `tools/list` →
+  `tools/call` through `garmx serve --stdio`; the call was persisted with the
+  client/server/exposed+original tool, a secret arg redacted to `[REDACTED]`, and
+  `garmx ui` rendered it. An unwritable DB path disabled audit with a warning
+  without interrupting the round-trip.
+
+> **Schema deviation to reconcile in Phase 4.** `audit_logs.server_name` is free
+> text with **no `server_id` foreign key** — the `servers` registry table does
+> not exist yet. `tool_exposed`/`tool_original` are also added beyond the
+> architecture-doc schema. Reconcile both when the SQLite catalog lands.
 
 ---
 
