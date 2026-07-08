@@ -28,17 +28,23 @@ Tasks to progress GarmX. Design docs now live in `docs/`
 
 ## Start here next session
 
-**Design spike — pin aggregation + version rules (discovery #2, #4).** The
-handshake research is now complete (both status-path and real tool-calling
-sessions captured — see below). Next: decide prefix length-budget threshold,
-eager page-merge vs cursor proxy, the supported client-side protocol version
-(evidence: **2025-11-25**), and upstream-mismatch behaviour. Encode as
-`aggregator/naming` + `capabilities` test cases. Key inputs now in hand:
+**Phase 1 — MCP core: daemon, one upstream, stdio client** (see
+`docs/implementation.md` Phase 1). Goal: Claude Code / OpenCode launches
+`garmx serve --stdio`, the shim relays to the daemon, and a full
+`initialize` → `tools/list` → `tools/call` round-trip works against **one**
+registered stdio upstream — no multi-server aggregation, persistence, or UI yet.
+This de-risks protocol correctness, stdio framing, the response demux, and the
+shim↔daemon channel.
+
+Design spike is done — the pure aggregation/version rules are pinned and coded
+in `internal/aggregator/naming.go` + `capabilities.go` (with table tests) and
+`pkg/mcp/capabilities.go` (version constants + capability types). Phase 1 builds
+on them. Inputs from the captures already folded in:
 
 - Both clients strip their own display prefix and call upstream with the **bare**
   tool name → GarmX's prefix is purely client-facing; strip before forwarding.
 - Both re-fetch `tools/list` on `list_changed` within ms → build `notify.go`
-  propagation with debounce.
+  propagation with debounce (Phase 2).
 - Claude Code consumes prompts + resources every session (OpenCode: tools only)
   → aggregate all three primitives, not just tools.
 - OpenCode sends `notifications/cancelled` for completed calls → no-op stale
@@ -60,13 +66,16 @@ template live in the scratchpad; the full source is in the appendix of
    lenient `2025-11-25` negotiation; bare-name upstream `tools/call`; both
    re-fetch `tools/list` on `list_changed`; Claude Code pulls prompts+resources
    per session (OpenCode tools-only); OpenCode's post-call `notifications/cancelled`.
-3. [ ] **Design spike — pin aggregation + version rules** (discovery #2, #4).
-   Decide: prefix length-budget threshold, eager page-merge vs cursor proxy, the
-   supported client-side protocol version (evidence says default **2025-11-25**),
-   and upstream-mismatch behaviour. Encode as `aggregator/naming` +
-   `capabilities` test cases.
+3. [x] **Design spike — pinned aggregation + version rules** (discovery #2, #4).
+   Decided and encoded with table tests: `server___tool` split (server names
+   `[a-z0-9-]`, 1..32); exposed-name warn >60, never truncate; **eager
+   page-merge** (no client cursor); client versions `{2025-11-25, 2025-06-18}`
+   pref `2025-11-25`; lenient upstream accept + visible mismatch; **union**
+   capability merge. In `internal/aggregator/{naming,capabilities}.go` +
+   `pkg/mcp/capabilities.go`. Details in `docs/discovery.md` #2/#4 (DECIDED).
 4. [ ] **Phase 1** — `pkg/mcp` typed surface + single stdio upstream + client
-   acceptance gate, informed by the captures above.
+   acceptance gate, informed by the captures above. (Extends the spike's
+   `pkg/mcp/capabilities.go` with `message.go`/`methods.go`/`parse.go`.)
 
 ## Later
 

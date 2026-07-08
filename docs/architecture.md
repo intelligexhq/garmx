@@ -160,16 +160,52 @@ Rules:
 - **On the way in** (`tools/call`, `prompts/get`): GarmX splits on the **first**
   `___`, looks up the server, strips the prefix, and forwards the **original**
   name to the upstream.
-- Server names are validated at registration to match `^[a-z0-9][a-z0-9-]*$`
-  (no `___`, lowercase), guaranteeing the split is unambiguous.
+- Server names are validated at registration to match `^[a-z0-9][a-z0-9-]*$`,
+  length **1..32** (no underscores, lowercase). Forbidding underscores is what
+  guarantees the first-`___` split is unambiguous — an upstream's *original*
+  name may itself contain `___` and still round-trips.
 - **Collision safety:** prefixing makes every exposed name globally unique, so
   two servers can both expose a `query` tool without conflict.
-- **Length budget:** many clients cap tool names (commonly 64–128 chars). The
-  prefix consumes part of that budget. GarmX warns at registration if
-  `len(serverName) + 3 + len(toolName)` exceeds 60, and the UI surfaces any
-  tools that would be truncated.
+- **Length budget:** many clients cap tool names (commonly 64–128 chars), and a
+  downstream client wraps the exposed name *again* (Claude Code presents it as
+  `mcp__<garmx>__<exposed>`), so the effective budget is tighter than it looks.
+  GarmX **warns** (non-fatal) at registration when the exposed name exceeds
+  **60** chars and the UI surfaces the offending tools; it **never truncates**,
+  since truncation would break the reversible split. Keep server names short.
 - **Resources are exempt:** they are addressed by `uri`, which is already
   namespaced; GarmX tracks URI ownership instead of rewriting.
+
+### Pagination (eager page-merge)
+
+`*/list` methods are cursor-paginated. GarmX **drains every upstream's pages**
+(follows each upstream's `nextCursor` to exhaustion) when it refreshes the
+merged view, caches the **complete** merged list per profile, and serves it in
+one response with **no client-facing `nextCursor`.** Local scale makes this
+simple and correct; a single synthesized aggregate cannot cleanly re-expose N
+independent upstream cursors through one opaque token. GarmX issues no cursors,
+so a client-supplied `cursor` is rejected with `-32602` (invalid params).
+
+### Protocol version negotiation
+
+- **Client face:** GarmX supports `{2025-11-25, 2025-06-18}` and prefers
+  `2025-11-25`. On `initialize` it echoes the client's requested version when
+  supported, otherwise returns the preferred one. It **never fails `initialize`
+  on version alone** — captured clients proceed on a differing server version.
+- **Upstream face:** GarmX sends the preferred version and **accepts whatever
+  the upstream reports** (the known revisions are wire-compatible for the
+  methods GarmX uses), recording it in `servers.protocol_version`. An
+  **unrecognized** version is **flagged as a mismatch** (degraded status, shown
+  in the UI) — never a silent drop. A server is marked offline only when the
+  handshake itself fails.
+
+### Capability merge
+
+The capabilities GarmX advertises to a client are the **union** of its
+upstreams': a capability is present if **any** upstream has it, and boolean
+sub-flags (`tools.listChanged`, `resources.subscribe`, …) are the **OR** across
+the upstreams that expose that capability. This is what lets a forwarded
+`list_changed` be meaningful — GarmX only advertises `listChanged` because at
+least one upstream backs it.
 
 ### Response demultiplexing (concurrency-correct)
 

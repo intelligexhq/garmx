@@ -92,6 +92,32 @@ upstreams.
 **Action:** Study MetaMCP, unrelated-ai/mcp-gateway, and AgentCore for edge
 cases. Encode decisions as tests in `aggregator/naming` and `capabilities`.
 
+**DECIDED (design spike) — encoded in `internal/aggregator/naming.go` +
+`capabilities.go` with table tests:**
+
+- **Prefix + split:** `server___tool`, split on the **first** `___`. Server
+  names match `^[a-z0-9][a-z0-9-]*$`, length **1..32** (no underscores → the
+  first delimiter is unambiguous). An upstream's *original* name may itself
+  contain `___` and still round-trips (first-delimiter split).
+- **Length budget:** warn (non-fatal) when the exposed name exceeds **60**
+  chars; never truncate (truncation breaks the reversible split). Rationale:
+  clients cap tool names near 64, and downstream clients wrap the name again
+  (`mcp__<garmx>__<exposed>`), so keep server names short. UI flags offenders.
+- **Capability merge:** **union** — advertise a capability if **any** upstream
+  has it; boolean sub-flags (`listChanged`, `resources.subscribe`) are the
+  **OR** across upstreams that expose it (`MergeServerCapabilities`).
+- **`list_changed` propagation:** build it — both clients re-fetch within ms
+  (see item #1 / `client-handshakes.md`). Debounce upstream storms into one
+  client-facing emit.
+- **Pagination — eager page-merge, no client-facing cursor.** GarmX drains each
+  upstream's `*/list` pages (follows upstream `nextCursor` to exhaustion) at
+  refresh time and serves the **complete** merged list, omitting `nextCursor`.
+  Local scale makes this simple and correct; one synthesized aggregate cannot
+  cleanly re-expose N independent upstream cursors through a single opaque
+  token. A client-supplied `cursor` (GarmX issues none) is rejected `-32602`.
+  *(Drain + cursor-rejection land as Phase 2 aggregator integration tests.)*
+- **Resources:** routed by `uri` ownership, not prefixed (unchanged).
+
 ---
 
 ### 3. Streamable HTTP wire details (both faces)
@@ -135,6 +161,22 @@ GarmX; GarmX negotiates separately with each upstream.
 - Record each upstream's negotiated version (already in `servers.protocol_version`).
 
 **Action:** Prototype in `capabilities.go`; make mismatch visible, never silent.
+
+**DECIDED (design spike) — encoded in `internal/aggregator/capabilities.go`:**
+
+- **Client face:** supported versions `{2025-11-25, 2025-06-18}`, preferred
+  **`2025-11-25`**. `NegotiateClientVersion` echoes a supported requested
+  version, else returns the preferred one; **never errors on version alone**
+  (captured clients proceed on a differing server version).
+- **Upstream face:** GarmX sends the preferred version. `NegotiateUpstreamVersion`
+  **accepts whatever the upstream reports** (the known revisions are wire-
+  compatible for the methods GarmX uses) and records it in
+  `servers.protocol_version`, but **flags an unrecognized version as a
+  mismatch** → the UI shows a degraded status. Never a silent drop; a server is
+  only marked offline when the handshake itself fails, not on version alone.
+- **Known revisions:** `2024-11-05`, `2025-03-26`, `2025-06-18`, `2025-11-25`
+  (`mcp.IsKnownProtocolVersion`). The `2026-07-28` RC (item #3) is deliberately
+  excluded until reviewed.
 
 ---
 
@@ -250,7 +292,12 @@ leaks," verified with a leak-checking `TestMain` and a synthetic-traffic client.
 | Live log transport (UI) | **WebSocket** (server→UI). Distinct from the client-facing MCP transports. |
 | Client-facing transports | **stdio (primary) + Streamable HTTP (secondary).** |
 | Upstream transports | **stdio + Streamable HTTP.** |
-| Name collisions | **`server___tool` prefixing** (AgentCore pattern). |
+| Name collisions | **`server___tool` prefixing** (AgentCore pattern). Split on the first `___`; server names `^[a-z0-9][a-z0-9-]*$`, len 1..32. |
+| Exposed-name length budget | **Warn (non-fatal) above 60 chars; never truncate.** Clients cap near 64 and re-wrap (`mcp__garmx__…`), so keep server names short; UI flags offenders. |
+| `*/list` pagination | **Eager page-merge, no client-facing cursor.** Drain each upstream's pages at refresh; serve the complete merged list; reject a client-supplied `cursor` with `-32602`. |
+| Client protocol version | **Support `{2025-11-25, 2025-06-18}`, prefer `2025-11-25`; echo if supported, else offer preferred. Never error on version alone.** |
+| Upstream version mismatch | **Accept whatever the upstream reports and record it; flag an unrecognized version as a visible mismatch (degraded), never a silent drop.** |
+| Capability merge | **Union — advertise if any upstream has it; OR the boolean sub-flags (`listChanged`, `subscribe`).** |
 | Server→client callbacks | **Deferred in v1**; session model keeps the back-ref so it's a later extension, not a rewrite. |
 | Registration source of truth | **SQLite is authoritative.** Config file is a one-directional seed/import, not a live mirror; no continuous file↔DB sync. `garmx import` adopts existing Claude Code / OpenCode configs; `garmx export` for backup. |
 | Access control (v1) | **Static profiles** — named server+tool subsets, selected at launch (`--profile`) over stdio. Default = expose everything. Curation-first; no RBAC engine until the HTTP daemon supplies real per-agent identity. |
