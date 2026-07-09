@@ -317,9 +317,12 @@ Precedence: built-in default → `audit` block in the config file → flag / env
 Front any stdio MCP command and pipe a session into it, then open the UI. A
 minimal echo upstream (no external deps):
 
-```text
+```bash
 mkdir /tmp/echoup && cd /tmp/echoup && go mod init echoup
 cat > main.go <<'EOF'
+```
+
+```go
 package main
 
 import ("bufio"; "encoding/json"; "fmt"; "os")
@@ -354,7 +357,7 @@ go build -o echoup .
 
 Drive one call through GarmX into it:
 
-```text
+```bash
 printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"smoke","version":"1"}}}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
@@ -370,6 +373,6 @@ appears, with `token` shown as `[REDACTED]`.
 
 Delete the database (and its WAL sidecars) to start clean:
 
-```text
+```bash
 rm -f ~/.local/share/garmx/audit.db*
 ```
