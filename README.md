@@ -1,13 +1,13 @@
 # GarmX
 
-A local-first **MCP aggregating gateway**, server catalog, and web UI in a
-single Go binary.
+**MCP registry and gateway** - self managed; includes, mcp server catalog, auditing, permission management, full OTEL observability export and a lean web UI. All in a single Go binary.
 
-GarmX presents itself to an AI client (Claude Code, OpenCode, …) as **one** MCP
-server, then fans requests out to many registered upstream MCP servers: it
-merges their tools/prompts/resources, prefixes names to avoid collisions
-(`server___tool`), and routes each call to the owning upstream. All traffic is
-audited locally and viewable in a built-in web UI.
+GarmX presents itself to an AI agents and clients (like  OpenCode, Claude Code, Langraph agents, etc.) as **one** MCP server;
+
+- It presents tool catalog to agents and fans all MCP requests out to many registered upstream MCP servers;
+- All traffic is audited and stored locally;
+- Viewable in a built-in web UI.
+- GarmX supports OTEL observability exports.
 
 > Status: early scaffold. The design is settled; implementation is in progress.
 
@@ -25,16 +25,17 @@ credentials and must not be exposed publicly.
 
 ## Development
 
-`make check` (fmt → lint → vet → test → build) is the gate; run it after every
+`make check` (fmt → lint → vet → test → build) is the gate; validate project with it after every
 change. Dev tools (gofumpt, golangci-lint, templ) are invoked via `go run` with
 pinned versions, so no global installs are required.
 
-Standards and conventions: [`AGENTS.md`](AGENTS.md).
+Standards and conventions are outlined in: [`AGENTS.md`](AGENTS.md).
 
 ## Documentation
 
+Concepts, design discussions and implementation plan:
+
 - [`docs/architecture.md`](docs/architecture.md) — system design, aggregation
-  model, package layout, schema.
-- [`docs/implementation.md`](docs/implementation.md) — phased build plan.
-- [`docs/discovery.md`](docs/discovery.md) — open research, decisions, and
-  dropped scope.
+  model, package layout, schemas.
+- [`docs/implementation.md`](docs/implementation.md) — phased build and implementation plan.
+- [`docs/discovery.md`](docs/discovery.md) — open research, decisions, and scope management.
