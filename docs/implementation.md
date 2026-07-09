@@ -3,7 +3,11 @@
 Phased build plan for GarmX. Each phase produces a working, testable
 increment. The sequencing is deliberate: **prove the MCP aggregation core with
 a real client (Claude Code / OpenCode) as early as possible** — that is the
-make-or-break risk, so it comes before persistence and UI.
+make-or-break risk, so it comes before persistence and UI. The second deliberate
+move is **observability-first**: the audit slice (Phase 3) is pulled ahead of
+full persistence and UI because GarmX's positioning leads with observability &
+audit (see [`research/mcp-protocol-map.md`](research/mcp-protocol-map.md)
+Part 0) — the differentiator must be real early, not last.
 
 ## Architecture recap
 
@@ -29,6 +33,9 @@ The plan below assumes the model defined in `architecture.md`:
 
 ## Phase 0: Project scaffolding — done
 
+**User value:** none directly — enabling work (module, gates, CI) so every later
+phase ships on a green `make check`.
+
 Go module, package directories with `doc.go`, Makefile with the `check` gate,
 `.golangci.yml`, CI running `make check`, and a thin `cmd/garmx/main.go`.
 `make check` is green.
@@ -36,6 +43,9 @@ Go module, package directories with `doc.go`, Makefile with the `check` gate,
 ---
 
 ## Phase 1: MCP core — one upstream, stdio client — done
+
+**User value:** point a real AI client (Claude Code / OpenCode) at GarmX and
+have it work like any MCP server — the beachhead that proves the whole approach.
 
 **Goal:** Claude Code (or OpenCode) launches `garmx serve --stdio`; a full
 `initialize` → `tools/list` → `tools/call` round-trip works against **one**
@@ -142,6 +152,10 @@ response demultiplexer.
 
 ## Phase 2: Aggregation — many upstreams, prefixing, profiles — done
 
+**User value:** register many MCP servers and expose them to an agent as **one**
+— no per-client config sprawl — and scope each agent to just the tools it needs
+(better tool selection, lower token cost). This is GarmX's core promise.
+
 **Goal:** Register N upstreams; GarmX presents the merged capability set with
 `server___tool` prefixing, routes calls back correctly, and scopes the merged
 view per session profile. **Done** — see the acceptance note below.
@@ -223,14 +237,11 @@ view per session profile. **Done** — see the acceptance note below.
 
 ---
 
-## Phase 3 (REVISED): Observability slice — SQLite audit + minimal UI — done
+## Phase 3: Observability slice — SQLite audit + minimal UI — done
 
-> **Reordering.** The original plan deferred all UI to Phase 5. This revision
-> pulled a **thin vertical slice** forward so GarmX's differentiator — *see every
-> MCP transaction in one place* — became visible right after aggregation, at
-> minimal cost. The fuller registry-as-source-of-truth + import/export work
-> (previously Phase 3) shifts to **Phase 4** (below). **Done** — see the delivered
-> note below.
+**User value:** see every MCP call your agents make in one place — tool, server,
+latency, errors, redacted args — so GarmX's audit/observability differentiator
+is real and visible, not just promised.
 
 **Goal:** every client transaction is written to SQLite (redacted, size-capped),
 and a **read-only** UI on `:9735` shows recent calls + basic stats. No
@@ -314,14 +325,11 @@ the audit plane real and visible.
 
 ---
 
-## Phase 4: Persistence — registry, catalog (was Phase 3)
+## Phase 4: Persistence — registry, catalog
 
-> **Note (pending approval of the Phase 3 revision).** The **audit** items below
-> (redaction, audit writer — steps 5–6) move into the new Phase 3. This phase
-> then focuses on making **SQLite the source of truth for the catalog**:
-> registry CRUD, `garmx import`/`export`, schema cache, health. The Streamable
-> HTTP, full UI, and export phases that follow keep their content; only their
-> numbers shift once the reorder is confirmed.
+**User value:** GarmX remembers your catalog across restarts, and `garmx import`
+sweeps servers already scattered across your Claude Code / OpenCode configs into
+one place — then you repoint every client at just `garmx`. The onboarding lever.
 
 **Goal:** SQLite becomes the source of truth for the catalog; schemas are
 cached; every transaction is audited (redacted, size-capped) with retention.
@@ -370,7 +378,11 @@ cached; every transaction is audited (redacted, size-capped) with retention.
 
 ---
 
-## Phase 4: Streamable HTTP (both faces)
+## Phase 5: Streamable HTTP (both faces)
+
+**User value:** connect **remote** MCP servers and reach GarmX from **remote**
+agents over HTTP — and, via per-agent token→profile identity, get real access
+control ("which agent may use which tools"), not just launch-time curation.
 
 **Goal:** GarmX speaks Streamable HTTP as a **client-facing** endpoint and as
 an **upstream** client. (Legacy HTTP+SSE is not implemented.) This face also
@@ -385,11 +397,24 @@ introduces real per-session identity, the basis for token→profile mapping.
 2. **`internal/frontend/streamhttp.go`** — GarmX-as-Streamable-HTTP **server**:
    single MCP endpoint (e.g. `/mcp`), `POST` for requests, optional `GET`+SSE
    stream, per-session state keyed by the MCP session id.
-3. **Identity:** map an authenticated session (bearer token) to a profile, so
-   scoping becomes enforceable per connecting agent — not just a launch flag.
-4. **Config**: `transport: "streamable-http"`, `url`, `headers` for upstreams;
+3. **Identity & RBAC (OAuth 2.1 resource server).** On the HTTP face, be a
+   correct resource server: publish RFC 9728 Protected Resource Metadata, answer
+   401 with `WWW-Authenticate`, and **validate every bearer token's signature,
+   expiry, issuer (`iss`, RC SEP-2468), and audience (= GarmX's canonical URI,
+   RFC 8707)** — rejecting foreign-audience tokens. Validation is **generic OIDC**
+   (discovery + JWKS), so any compliant IdP works with no per-IdP code; **GarmX
+   is never an authorization server.** Then map **token → role → profile** so
+   scoping is enforceable per connecting agent, not just a launch flag. (Design
+   basis: `research/mcp-protocol-map.md` Part 3.5.)
+4. **Upstream auth — Model A, no token passthrough.** For a protected remote
+   upstream, GarmX acts as *its* OAuth client and holds a **separate** token
+   bound to that upstream; it **MUST NOT** forward the client's token
+   (confused-deputy / spec-forbidden). **Identity terminates at GarmX**
+   (upstreams see "GarmX"); per-user propagation via OBO/token-exchange is a
+   deferred, demand-gated capability — never raw passthrough.
+5. **Config**: `transport: "streamable-http"`, `url`, `headers` for upstreams;
    `serve --http` / `serve --stdio` (or both) for the daemon.
-5. UI: transport-specific fields in add/edit forms.
+6. UI: transport-specific fields in add/edit forms.
 
 ### Tests
 
@@ -397,16 +422,25 @@ introduces real per-session identity, the basis for token→profile mapping.
 - Client-facing: drive the `/mcp` endpoint through a Streamable-HTTP client and
   assert an end-to-end call.
 - Token→profile: two sessions with different tokens see different scoped views.
+- Auth validation: a token with the wrong audience or a bad `iss` is rejected
+  (401/403); a valid token resolves to its role→profile.
+- No passthrough: the client's token is never sent upstream — the upstream
+  receives GarmX's own credential.
 
 ### Deliverables
 
 - Remote MCP servers usable as upstreams.
 - Clients can connect to GarmX over Streamable HTTP as well as stdio.
-- Per-agent scoping enforceable via token identity.
+- Per-agent scoping enforceable via token identity (audience/`iss`-validated),
+  with identity terminating at GarmX and no token passthrough to upstreams.
 
 ---
 
-## Phase 5: Embedded UI (HTMX + Templ)
+## Phase 6: Embedded UI (HTMX + Templ)
+
+**User value:** manage everything from a browser — add/edit servers, browse each
+server's tools (exposed vs original names), and watch live traffic — instead of
+hand-editing config files.
 
 **Goal:** Web interface for managing upstreams, browsing capabilities, and a
 minimal live view of traffic.
@@ -448,7 +482,94 @@ minimal live view of traffic.
 
 ---
 
-## Phase 6: Export, security, performance, docs
+## Phase 7: Async & interactive tool lifecycle — Tasks, elicitation, progress, cancellation
+
+**User value:** long-running tool calls (deep research, builds, batch jobs) and
+mid-call user prompts (a confirmation, a missing field) both work **through**
+GarmX instead of breaking behind it — and every one is **audited**. You get one
+view of all in-flight long-running MCP operations across every upstream, an audit
+trail of what upstreams ask your users for (catch secret-fishing; rate-limit),
+and the *reverse* and *long-running* directions of the observability plane that
+no single client gives you.
+
+**Goal:** GarmX **brokers** — never executes — the full async/interactive tool
+lifecycle between clients and upstreams (long-running Tasks, input-required
+elicitation, progress, cancellation) and audits it. Tasks is the spine;
+elicitation is its input-required branch.
+
+### Design basis
+
+`research/mcp-protocol-map.md` Part 3.4 (input-required / elicitation) + Part 3.6
+(Tasks). Both build on the RC (2026-07-28): input-required uses the multi-round-
+trip `InputRequiredResult` (SEP-2322); Tasks is an optional, independently-
+versioned extension (SEP-1686 / SEP-2663). Both fit GarmX's existing pass-through
+routing — **no task state machine and no bidirectional callback channel are
+reimplemented.**
+
+### Order of implementation
+
+1. **Tasks — broker-only routing (the spine).** Advertise the Tasks extension to
+   clients as the **union** of upstreams that support it. When an upstream answers
+   a `tools/call` with a `CreateTaskResult`, relay it; route `tasks/get` /
+   `tasks/result` / `tasks/update` / `tasks/cancel` back to the owning upstream by
+   **wrapping the upstream's opaque task ID** with the server name (reversible,
+   stateless — same philosophy as `server___tool`). GarmX keeps **only** the
+   id→upstream handle + audit rows; the upstream owns task state. *Verify first:*
+   confirm real clients treat task IDs as opaque before fixing the wrap format.
+2. **Input-required (elicitation) — the interactive branch.** RC multi-round-trip:
+   relay the upstream's `InputRequiredResult`; route the client's re-issued call
+   (carrying `inputResponses` + opaque `requestState`) to the **same upstream**
+   (affinity); preserve `requestState` / `inputRequests` opaquely. Advertise
+   `elicitation` to upstreams as the **union** of clients; **auto-decline** cleanly
+   if the originating client lacks it.
+3. **Progress & cancellation.** Relay `notifications/progress` (by `progressToken`)
+   back to the originating session; standardize `tasks/cancel` for task
+   cancellation; no-op `notifications/cancelled` for unknown/finished ids
+   (OpenCode emits these for completed calls).
+4. **Safety mediation.** Flag/deny elicitation that appears to solicit secrets
+   (spec: servers MUST NOT); optional per-upstream rate limiting.
+5. **Audit / OTel.** Model a task as a **long-lived span** with lifecycle
+   transitions (`working` → `completed`/`failed`/`cancelled`) and real duration;
+   record input-required exchanges as "upstream → user" events (which upstream,
+   prompt/schema, accept/decline/cancel — **never** the entered values when
+   sensitive).
+6. **Legacy bridge (decide).** Whether to also support clients still on the stable
+   `elicitation/create` server→client request model, or require the RC shape
+   (open — `research/mcp-protocol-map.md` Part 6, item 2).
+
+**Accepted edge case:** an upstream crash mid-task loses the task (state lived
+upstream) → GarmX surfaces `failed`. GarmX is a broker, not durable across
+upstream restarts.
+
+### Tests
+
+- Tasks: a mock upstream returns `CreateTaskResult`; GarmX relays it and routes
+  `tasks/get`/`tasks/result` (via the wrapped id) to the same upstream; the
+  lifecycle is audited.
+- Input-required: a mock upstream returns `InputRequiredResult`; the client
+  re-issues with `requestState`; GarmX routes the follow-up to the same upstream;
+  the exchange is audited.
+- Capability mismatch: originating client lacks `elicitation` → GarmX
+  auto-declines and nothing hangs.
+- Cancellation: `tasks/cancel` reaches the owning upstream; `notifications/cancelled`
+  for a finished id is a no-op.
+- Upstream crash mid-task → GarmX surfaces `failed`.
+- Secret-solicitation heuristic flags a disallowed elicitation.
+
+### Deliverables
+
+- Long-running (Tasks) and interactive (elicitation) tool calls work end-to-end
+  through GarmX, broker-only.
+- The full async/interactive lifecycle is audited and visible in the UI — the
+  reverse and long-running directions of the observability plane.
+
+---
+
+## Phase 8: Export, security, performance, docs
+
+**User value:** pipe GarmX's telemetry into the observability stack you already
+run — Grafana / Prometheus / Loki / Tempo — so GarmX **feeds** your dashboards
+rather than becoming a second one; plus production-hardened credential handling.
 
 **Goal:** Production-ready edges and the observability export path.
 
@@ -490,6 +611,55 @@ minimal live view of traffic.
 
 ---
 
+## Phase 9: Demo stack — one-command showcase (docker compose)
+
+**User value:** evaluate GarmX in minutes — `docker compose up` and see
+aggregation + centralized audit + OTEL observability on real MCP servers with
+**zero required secrets**, before committing to it. The adoption on-ramp.
+
+**Goal:** `docker compose up` and, within minutes, an adopter sees GarmX's
+value — **aggregation + centralized audit + OTEL observability across multiple
+upstreams** — with real MCP servers and **zero required secrets**. This is the
+adoption on-ramp, not a product feature; it lives in the repo as a runnable
+showcase and the basis for the "getting started" tutorial.
+
+**Depends on:** Phase 5 (Streamable HTTP client-facing face, so containerized
+agents/clients reach GarmX at a URL) and Phase 8 (OTLP export, so the
+observability panes populate). Design rationale and open questions live in
+[`research/mcp-protocol-map.md`](research/mcp-protocol-map.md) → Part 5.
+
+### Components
+
+1. **`garmx`** — Streamable HTTP MCP endpoint + UI on `:9735`; OTLP → the
+   collector. The star of the demo.
+2. **`grafana/otel-lgtm`** — all-in-one (OTel Collector + Prometheus + Tempo +
+   Loki + Grafana) as the **fast path**; one container gives the full LGTM
+   stack. A layered variant (discrete services) can follow.
+3. **Reference upstreams (2–3)** — at least one **stdio** server (in the garmx
+   container) and one **remote Streamable-HTTP** server (peer container) to
+   exercise both upstream transports; mix a read-only server with one that has
+   side effects (e.g. a Postgres-backed server) so traces are meaningful.
+4. **Zero-secret synthetic agent** — a traffic generator that drives
+   representative tool calls through GarmX so dashboards light up with **no API
+   keys**. Optional real-client overlay (OpenCode → local model, or Claude Code).
+5. **Pre-built Grafana dashboard** for GarmX spans/metrics, shipped with the
+   demo so value is visible on first load.
+
+### Deliverables
+
+- `docker-compose.yml` (fast path) + optional layered compose (broken-out
+  collector/Prometheus/Tempo/Loki/Grafana).
+- `demo.jsonc` seeding the upstreams; a pre-provisioned Grafana dashboard.
+- A short "run the demo" tutorial.
+
+### Open decisions (tracked in research doc Part 5)
+
+- Which reference upstreams best showcase aggregation *and* audit value.
+- Synthetic agent: scripted deterministic traffic vs a small local-model loop.
+- Single fast compose vs a layered fast+realistic pair.
+
+---
+
 ## Testing strategy summary
 
 | Level       | Tool                        | Scope                                              |
@@ -510,10 +680,10 @@ Naming: unit `*_test.go`; integration `*_integration_test.go` behind
 | Dependency | Phase | Purpose | Risk |
 |------------|-------|---------|------|
 | `modernc.org/sqlite` | 3 | Pure-Go SQLite (no CGo) | Low |
-| `github.com/a-h/templ` | 5 | Type-safe templates | Medium — CLI needed for build |
-| `github.com/coder/websocket` (or `gorilla/websocket`) | 5 | WebSocket log stream | Low |
+| `github.com/a-h/templ` | 6 | Type-safe templates | Medium — CLI needed for build |
+| `github.com/coder/websocket` (or `gorilla/websocket`) | 6 | WebSocket log stream | Low |
 | `golang.org/x/sync` | 2 | `errgroup` for fan-out | Low |
-| OTLP export (`go.opentelemetry.io/otel*` or hand-rolled) | 6 | Metrics/logs/traces export | Medium — weigh SDK vs `<100 lines` |
+| OTLP export (`go.opentelemetry.io/otel*` or hand-rolled) | 8 | Metrics/logs/traces export | Medium — weigh SDK vs `<100 lines` |
 | `github.com/mark3labs/mcp-go` | — | **Reference only** for wire behaviour, not a dependency | — |
 
 **No HTTP router dependency** — Go 1.22+ `net/http` mux covers method + path
