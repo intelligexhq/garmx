@@ -1,7 +1,7 @@
 # GarmX
 
 [![CI](https://github.com/intelligexhq/garmx/actions/workflows/ci.yml/badge.svg)](https://github.com/intelligexhq/garmx/actions/workflows/ci.yml)
-[![License: AGPL v3](https://img.shields.io/badge/license-AGPLv3-blue.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/intelligexhq/garmx/pulls)
 [![Contributors Wanted](https://img.shields.io/badge/contributors-wanted-orange.svg)](CONTRIBUTING.md)
 [![Early Adopters Wanted](https://img.shields.io/badge/early%20adopters-wanted-blue.svg)](https://github.com/intelligexhq/garmx/issues)
@@ -62,12 +62,8 @@ While project is eveolving, concepts, design discussions and implementation plan
 
 ## Contributing
 
-Contributions are welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md). All
-contributors sign a one-time [Contributor License Agreement](CLA.md).
+Contributions are welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## License
 
-GarmX is licensed under the **GNU Affero General Public License v3.0** — see
-[`LICENSE`](LICENSE). The AGPL keeps GarmX and any networked modifications open;
-a commercial license may be offered for organizations that cannot use AGPL
-software.
+GarmX is licensed under the **Apache License 2.0** — see [`LICENSE`](LICENSE).
