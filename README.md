@@ -1,8 +1,9 @@
 # GarmX
 
 [![CI](https://github.com/intelligexhq/garmx/actions/workflows/ci.yml/badge.svg)](https://github.com/intelligexhq/garmx/actions/workflows/ci.yml)
+[![License: AGPL v3](https://img.shields.io/badge/license-AGPLv3-blue.svg)](LICENSE)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/intelligexhq/garmx/pulls)
-[![Contributors Wanted](https://img.shields.io/badge/contributors-wanted-orange.svg)](https://github.com/intelligexhq/garmx/issues)
+[![Contributors Wanted](https://img.shields.io/badge/contributors-wanted-orange.svg)](CONTRIBUTING.md)
 [![Early Adopters Wanted](https://img.shields.io/badge/early%20adopters-wanted-blue.svg)](https://github.com/intelligexhq/garmx/issues)
 
 > Project Status: early stage release. The design is settled; implementation is in progress; can use project for early build - it is usable and available
@@ -58,3 +59,15 @@ While project is eveolving, concepts, design discussions and implementation plan
   model, package layout, schemas.
 - [`docs/implementation.md`](docs/implementation.md) — phased build and implementation plan.
 - [`docs/discovery.md`](docs/discovery.md) — open research, decisions, and scope management.
+
+## Contributing
+
+Contributions are welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md). All
+contributors sign a one-time [Contributor License Agreement](CLA.md).
+
+## License
+
+GarmX is licensed under the **GNU Affero General Public License v3.0** — see
+[`LICENSE`](LICENSE). The AGPL keeps GarmX and any networked modifications open;
+a commercial license may be offered for organizations that cannot use AGPL
+software.
